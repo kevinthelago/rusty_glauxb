@@ -1,0 +1,82 @@
+[package]
+name = "rusty_glauxb"
+version = "0.1.0"
+edition = "2021"
+default-run = "rusty_glauxb"
+
+[lib]
+name = "rusty_glauxb"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "rusty_glauxb"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[package.metadata.android]
+package = "com.rusty_glauxb"
+label = "rusty_glauxb"
+build_targets = ["aarch64-linux-android", "armv7-linux-androideabi"]
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_FINE_LOCATION"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.RECORD_AUDIO"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_WIFI_STATE"
+
+[dependencies]
+# Rendering
+wgpu = "22"
+winit = { version = "0.30", features = ["android-native-activity"] }
+glam = "0.29"
+
+# GUI overlay
+egui = "0.29"
+egui-wgpu = "0.29"
+egui-winit = "0.29"
+
+# Async runtime + WebSocket
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
+# HTTP + serialization
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "charset", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Audio capture (push-to-talk)
+cpal = "0.15"
+hound = "3.5"
+async-trait = "0.1"
+
+# Utilities
+anyhow = "1"
+pollster = "0.3"
+dirs = "5"
+earcutr = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytemuck = { version = "1", features = ["derive"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }
+
+# Process memory sampling — not available on Android
+[target.'cfg(not(target_os = "android"))'.dependencies]
+sysinfo = "0.30"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
