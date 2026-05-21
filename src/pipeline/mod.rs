@@ -45,6 +45,7 @@
 
 pub mod flights;
 pub mod osm;
+pub mod rate_limit;
 
 use std::{
     collections::HashMap,
@@ -52,7 +53,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::{runtime::Handle, sync::watch};
+use tokio::{runtime::Handle, sync::{mpsc, watch}};
+
+use rate_limit::RateLimitError;
 
 use crate::geo::{GeoBounds, GeoFeature};
 
@@ -100,24 +103,73 @@ struct QueryScheduler {
     last_fetch:  Instant,
     max_staleness: Duration,
     min_change_fraction: f32,
+    /// Hard floor between any two fetches regardless of viewport movement.
+    min_cooldown: Duration,
+    /// When set, suppresses all fetches until this instant (rate-limit backoff).
+    backoff_until: Option<Instant>,
+    /// Bypasses the cooldown floor for the very first fetch.
+    force_next: bool,
 }
 
 impl QueryScheduler {
     fn new(max_staleness_secs: f32, min_change_fraction: f32) -> Self {
         Self {
             last_bounds:         None,
-            last_fetch:          Instant::now() - Duration::from_secs(3600), // force first fetch
+            last_fetch:          Instant::now(),
             max_staleness:       Duration::from_secs_f32(max_staleness_secs),
             min_change_fraction,
+            min_cooldown:        Duration::from_secs(60),
+            backoff_until:       None,
+            force_next:          true,
         }
+    }
+
+    fn with_cooldown(mut self, secs: u64) -> Self {
+        self.min_cooldown = Duration::from_secs(secs);
+        self
+    }
+
+    /// Suppress fetches for at least `delay` from now.  Takes the maximum if
+    /// a backoff is already in effect.
+    fn apply_backoff(&mut self, delay: Duration) {
+        let until = Instant::now() + delay;
+        self.backoff_until = Some(match self.backoff_until {
+            Some(existing) => existing.max(until),
+            None           => until,
+        });
+        // Also push last_fetch forward so staleness doesn't immediately override the backoff.
+        self.last_fetch = Instant::now();
     }
 
     /// Returns `true` and records the new bounds if a fetch should fire.
     fn should_fetch(&mut self, bounds: &GeoBounds) -> bool {
         let now = Instant::now();
 
+        // Rate-limit backoff takes top priority.
+        if let Some(until) = self.backoff_until {
+            if now < until {
+                return false;
+            }
+            self.backoff_until = None;
+        }
+
+        // Force the very first fetch regardless of cooldown.
+        if self.force_next {
+            self.force_next  = false;
+            self.last_bounds = Some(bounds.clone());
+            self.last_fetch  = now;
+            return true;
+        }
+
+        let elapsed = now.duration_since(self.last_fetch);
+
+        // Never fetch faster than min_cooldown, regardless of other conditions.
+        if elapsed < self.min_cooldown {
+            return false;
+        }
+
         // Always fetch on first call or after staleness timeout
-        if self.last_bounds.is_none() || now.duration_since(self.last_fetch) >= self.max_staleness {
+        if self.last_bounds.is_none() || elapsed >= self.max_staleness {
             self.last_bounds = Some(bounds.clone());
             self.last_fetch  = now;
             return true;
@@ -136,6 +188,21 @@ impl QueryScheduler {
     }
 }
 
+fn make_scheduler(source: &dyn DataSource) -> QueryScheduler {
+    let cooldown_secs = if source.max_staleness_secs() >= 3600.0 {
+        // Static/daily sources (OSM, world-map): 60 s hard floor so the app
+        // can't hammer rate-limited public APIs when panning rapidly.
+        60
+    } else {
+        // Live feeds: 5 s floor protects against burst retries on error.
+        5
+    };
+    QueryScheduler::new(
+        source.max_staleness_secs(),
+        source.min_change_fraction(),
+    ).with_cooldown(cooldown_secs)
+}
+
 // ─── PipelineManager ─────────────────────────────────────────────────────────
 
 /// Holds all registered data sources and drives the fetch-dispatch loop.
@@ -146,15 +213,21 @@ pub struct PipelineManager {
     senders:  HashMap<String, watch::Sender<Vec<GeoFeature>>>,
     /// Receivers handed to `DataLayer` impls during startup via `subscribe()`.
     receivers: HashMap<String, watch::Receiver<Vec<GeoFeature>>>,
+    /// Rate-limit backoff signals sent from spawned fetch tasks.
+    backoff_tx: mpsc::UnboundedSender<(String, Duration)>,
+    backoff_rx: mpsc::UnboundedReceiver<(String, Duration)>,
 }
 
 impl PipelineManager {
     pub fn new(rt: Handle) -> Self {
+        let (backoff_tx, backoff_rx) = mpsc::unbounded_channel();
         Self {
             rt,
-            sources:   Vec::new(),
-            senders:   HashMap::new(),
-            receivers: HashMap::new(),
+            sources:    Vec::new(),
+            senders:    HashMap::new(),
+            receivers:  HashMap::new(),
+            backoff_tx,
+            backoff_rx,
         }
     }
 
@@ -167,10 +240,7 @@ impl PipelineManager {
             self.receivers.insert(layer.clone(), rx);
             tx
         });
-        let scheduler = QueryScheduler::new(
-            source.max_staleness_secs(),
-            source.min_change_fraction(),
-        );
+        let scheduler = make_scheduler(&*source);
         self.sources.push((source, scheduler));
     }
 
@@ -188,13 +258,28 @@ impl PipelineManager {
     /// spawns a `tokio` task that calls `DataSource::fetch` and pushes the
     /// result through the watch channel.
     pub fn tick(&mut self, bounds: &GeoBounds) {
+        // Apply any rate-limit backoffs signalled by in-flight tasks.
+        while let Ok((layer, delay)) = self.backoff_rx.try_recv() {
+            for (source, scheduler) in &mut self.sources {
+                if source.layer_name() == layer {
+                    tracing::warn!(
+                        source = source.name(),
+                        delay_s = delay.as_secs(),
+                        "applying rate-limit backoff"
+                    );
+                    scheduler.apply_backoff(delay);
+                }
+            }
+        }
+
         for (source, scheduler) in &mut self.sources {
             if !scheduler.should_fetch(bounds) {
                 continue;
             }
 
-            let source  = Arc::clone(source);
-            let bounds  = bounds.clone();
+            let source     = Arc::clone(source);
+            let bounds     = bounds.clone();
+            let backoff_tx = self.backoff_tx.clone();
             let Some(tx) = self.senders.get(source.layer_name()).cloned() else {
                 continue;
             };
@@ -205,10 +290,21 @@ impl PipelineManager {
                         // Ignore send errors — receiver may have been dropped
                         let _ = tx.send(features);
                     }
-                    Err(e) => tracing::error!(
-                        source = source.name(),
-                        "fetch error: {e:#}"
-                    ),
+                    Err(e) => {
+                        if let Some(rl) = e.downcast_ref::<RateLimitError>() {
+                            tracing::warn!(
+                                source = source.name(),
+                                retry_after_s = rl.retry_after.as_secs(),
+                                "rate limited (429)"
+                            );
+                            let _ = backoff_tx.send((
+                                source.layer_name().to_string(),
+                                rl.retry_after,
+                            ));
+                        } else {
+                            tracing::error!(source = source.name(), "fetch error: {e:#}");
+                        }
+                    }
                 }
             });
         }
@@ -245,10 +341,7 @@ impl PipelineManager {
         });
         // Drop all old sources for this layer, install the new one
         self.sources.retain(|(s, _)| s.layer_name() != layer);
-        let scheduler = QueryScheduler::new(
-            source.max_staleness_secs(),
-            source.min_change_fraction(),
-        );
+        let scheduler = make_scheduler(&*source);
         self.sources.push((source, scheduler));
     }
 

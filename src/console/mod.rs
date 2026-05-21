@@ -28,12 +28,20 @@ pub struct ConsoleOutput {
     pub geo_cmd:           Option<GeoCmd>,
     /// User issued a `topo` sub-command.
     pub topo_cmd:          Option<TopoCmd>,
-    /// User issued a `spectrum` sub-command.
-    pub spectrum_cmd:      Option<SpectrumCmd>,
     /// User issued a `diag` sub-command.
     pub diag_cmd:          Option<DiagCmd>,
     /// User issued a `location` sub-command.
     pub location_cmd:      Option<LocationCmd>,
+    /// User issued an `aircraft` sub-command.
+    pub aircraft_cmd:      Option<AircraftCmd>,
+    /// User issued a `download` sub-command.
+    pub download_cmd:      Option<DownloadCmd>,
+    /// User issued a `directions` sub-command.
+    pub directions_cmd:    Option<DirectionsCmd>,
+    /// User issued a `milsym` sub-command.
+    pub milsym_cmd:        Option<MilsymCmd>,
+    /// User issued a `symbol` sub-command.
+    pub symbol_cmd:        Option<SymbolCmd>,
     /// User issued `kill [<stream>]` — stop one or all pipeline streams.
     pub kill_target:       Option<KillTarget>,
     /// User issued `quit` — request application exit.
@@ -50,9 +58,13 @@ impl Default for ConsoleOutput {
             set_layer_visible: None,
             geo_cmd:           None,
             topo_cmd:          None,
-            spectrum_cmd:      None,
             diag_cmd:          None,
             location_cmd:      None,
+            aircraft_cmd:      None,
+            download_cmd:      None,
+            directions_cmd:    None,
+            milsym_cmd:        None,
+            symbol_cmd:        None,
             kill_target:       None,
             quit:              false,
             clip_text:         None,
@@ -77,15 +89,10 @@ pub enum GeoCmd {
     SetNames(bool),
     SetFill(bool),
     SetBorders(bool),
+    /// Toggle the globe wireframe mesh visibility.
+    SetMesh(bool),
     Back,
     Status,
-}
-
-/// Spectrum overlay commands forwarded to `app.rs`.
-#[derive(Debug, Clone)]
-pub enum SpectrumCmd {
-    SetVisible(bool),
-    SetSource(String),
 }
 
 /// Diagnostics commands forwarded to `app.rs`.
@@ -112,6 +119,59 @@ pub enum LocationCmd {
     Status,
     /// Stop the active source (same as SetSource("off")).
     Stop,
+}
+
+/// Aircraft display commands forwarded to `app.rs`.
+#[derive(Debug, Clone)]
+pub enum AircraftCmd {
+    /// Set the always-on label field: "none" | "callsign" | "type" | "altitude" | "speed" | "icao24".
+    SetLabel(String),
+    /// Enable or disable click-to-follow.
+    SetFollowOnClick(bool),
+}
+
+/// Download catalog / custom-URL commands forwarded to `app.rs`.
+#[derive(Debug, Clone)]
+pub enum DownloadCmd {
+    /// Fetch a GeoJSON URL and load it as a topo layer.
+    Fetch { name: String, url: String, cache_secs: u64 },
+    /// Delete the cached data and drop the layer.
+    Clear(String),
+}
+
+/// Routing / directions commands forwarded to `app.rs`.
+#[derive(Debug, Clone)]
+pub enum DirectionsCmd {
+    /// Fetch a driving route between two locations (address or "lat,lon").
+    Fetch { from: String, to: String },
+}
+
+/// Military symbology commands forwarded to `app.rs`.
+#[derive(Debug, Clone)]
+pub enum MilsymCmd {
+    /// Enable or disable milsym mode.
+    SetEnabled(bool),
+    /// Set symbol scale multiplier.
+    SetScale(f32),
+    /// Show/hide echelon indicator above each symbol.
+    SetEchelon(bool),
+    /// Override the affiliation for a category: entity = "civil" | "military" | "unknown".
+    SetAffiliation { entity: String, affiliation: String },
+    /// Print current milsym configuration.
+    Status,
+}
+
+/// Symbol-map console commands forwarded to `app.rs`.
+#[derive(Debug, Clone)]
+pub enum SymbolCmd {
+    /// Load an SVG file from disk and assign it to an icon key in the active standard.
+    Assign { key: String, path: String },
+    /// Clear the SVG assignment for a key (reverts to hand-drawn icon).
+    Clear(String),
+    /// Switch the active symbology standard ("app6a" | "milstd2525d").
+    SetStandard(String),
+    /// List all recognised keys with a loaded/missing indicator.
+    List,
 }
 
 /// Target for the `kill` command.
@@ -156,8 +216,12 @@ pub struct Console {
     geo_names:        bool,
     geo_fill:         bool,
     geo_borders:      bool,
+    geo_mesh:         bool,
     /// Mirrored topo layer list (name, visible) for status display.
     topo_layers:      Vec<(String, bool)>,
+    /// Mirrored aircraft display state for status display.
+    aircraft_label:   String,
+    aircraft_follow:  bool,
     /// Floating TTL overlay showing the most recent command's output.
     result_overlay:   Option<ResultOverlay>,
     /// Set to true while execute() is running so push() also writes to captured_lines.
@@ -184,7 +248,10 @@ impl Console {
             geo_names:        true,
             geo_fill:         true,
             geo_borders:      true,
+            geo_mesh:         true,
             topo_layers:      Vec::new(),
+            aircraft_label:   "none".to_string(),
+            aircraft_follow:  true,
             result_overlay:   None,
             capturing:        false,
             captured_lines:   Vec::new(),
@@ -317,9 +384,11 @@ impl Console {
                         .min(sr.height() * 0.65)
                         .max(32.0);
                     let ov_w  = (sr.width() - 20.0).max(120.0);
+                    // Anchor to the TOP of the scroll area so the overlay never
+                    // reaches the separator / input bar below.
                     let ov_pos = egui::pos2(
                         sr.min.x + 10.0,
-                        sr.max.y - ov_h - 6.0,
+                        sr.min.y + 8.0,
                     );
 
                     let bg_a   = (*alpha * 210.0) as u8;
@@ -494,13 +563,17 @@ impl Console {
                 self.push("  geo       control the world-map polygon layer");
                 self.push("  topo      load and control a GeoJSON topology layer");
                 self.push("  camera    control camera animation mode");
-                self.push("  spectrum  toggle the RF spectrum analyzer overlay");
                 self.push("  diag      show frame-time / FPS / memory diagnostics");
                 self.push("  clip      copy any command's output to the clipboard");
                 self.push("  clear     clear this output");
-                self.push("  location  control location services");
-                self.push("  exit      close the console");
-                self.push("  kill      stop streams or kill the application");
+                self.push("  download    browse and fetch GeoJSON datasets from the catalog");
+                self.push("  directions  get driving directions between two locations");
+                self.push("  location    control location services");
+                self.push("  aircraft    configure aircraft dot labels and click-to-follow");
+                self.push("  milsym      toggle MIL-STD-2525D military symbology mode");
+                self.push("  symbol      assign SVG icons per symbology standard");
+                self.push("  exit        close the console");
+                self.push("  kill        stop streams or kill the application");
             }
 
             // ── set ──────────────────────────────────────────────────────────
@@ -565,13 +638,15 @@ impl Console {
             "source" => {
                 if help {
                     self.push("source                    — list all datastreams and current sources");
-                    self.push("source <stream>           — list available APIs for that stream");
-                    self.push("source <stream> <api>     — switch the stream to a different API");
+                    self.push("source <stream>           — list available sources for that stream");
+                    self.push("source <stream> <src>     — switch the stream to a different source");
                     self.push("");
-                    self.push("  Streams:  flights");
+                    self.push("  Streams:  flights   directions   location");
                     self.push("            roads, railways  (fixed OSM source, not configurable)");
                     self.push("");
-                    self.push("  Example:  source flights opensky");
+                    self.push("  Examples:");
+                    self.push("    source flights opensky");
+                    self.push("    source location mock");
                 } else {
                     let stream = parts.get(1).copied().unwrap_or("");
                     let api    = parts.get(2).copied().unwrap_or("");
@@ -579,6 +654,8 @@ impl Console {
                         "" => {
                             self.push("datastream    source");
                             self.push(format!("  flights     {}", settings.flight_source));
+                            self.push(format!("  directions  {}", settings.directions_source));
+                            self.push("  location    (use 'source location' to list)");
                             self.push("  roads       osm (fixed)");
                             self.push("  railways    osm (fixed)");
                         }
@@ -594,7 +671,7 @@ impl Console {
                                 const VALID: &[&str] = &["adsbfi", "opensky", "adsbexchange", "flightaware"];
                                 if !VALID.contains(&api) {
                                     self.push(format!(
-                                        "unknown flights API '{api}' — valid: adsbfi, opensky, adsbexchange, flightaware"
+                                        "unknown flights source '{api}' — valid: adsbfi, opensky, adsbexchange, flightaware"
                                     ));
                                 } else if settings.get("flight_source") == api {
                                     self.push(format!("flights source already: {api}"));
@@ -609,12 +686,46 @@ impl Console {
                                 }
                             }
                         }
+                        "location" => {
+                            if api.is_empty() {
+                                self.push("location sources:");
+                                self.push("  mock     — animated circular path (always available)");
+                                self.push("  network  — WebSocket stream; set URL with 'location connect'");
+                                self.push("  native   — Android device GPS (Android only)");
+                                self.push("  off      — stop location services");
+                            } else {
+                                self.push(format!("location → {api}"));
+                                return ConsoleOutput {
+                                    location_cmd: Some(LocationCmd::SetSource(api.to_string())),
+                                    ..Default::default()
+                                };
+                            }
+                        }
+                        "directions" => {
+                            if api.is_empty() {
+                                self.push(format!("directions source: {}  (current)", settings.directions_source));
+                                self.push("");
+                                self.push("  osrm    — OSRM public API, no auth required (default)");
+                                self.push("  google  — Google Maps Directions API; requires google_maps_api_key");
+                            } else {
+                                match api {
+                                    "osrm" | "google" => {
+                                        settings.directions_source = api.to_string();
+                                        settings.save();
+                                        self.push(format!("directions → {api}"));
+                                    }
+                                    _ => self.push(format!(
+                                        "unknown directions source '{api}' — valid: osrm, google"
+                                    )),
+                                }
+                            }
+                        }
                         "roads" | "railways" => {
                             self.push(format!("{stream}: source is fixed (OSM — not configurable)"));
                         }
                         other => {
                             self.push(format!(
-                                "unknown datastream '{other}' — known streams: flights, roads, railways"
+                                "unknown datastream '{other}' — known: flights, directions, location, roads, railways"
                             ));
                         }
                     }
@@ -626,11 +737,13 @@ impl Console {
                 if help {
                     self.push("refresh <layer>");
                     self.push("");
-                    self.push("Forces an immediate re-fetch of a data layer,");
-                    self.push("bypassing the normal refresh interval.");
+                    self.push("Forces an immediate re-fetch of a data layer.");
+                    self.push("For pipeline layers, bypasses the normal refresh interval.");
+                    self.push("For download layers, busts the disk cache and re-downloads.");
                     self.push("");
-                    self.push("  Available layers:  roads, railways");
-                    self.push("  Example:  refresh roads");
+                    self.push("  Pipeline layers:  flights, roads, railways");
+                    self.push("  Download layers:  airports, earthquakes, volcanoes, …");
+                    self.push("  Example:  refresh airports");
                 } else if parts.len() < 2 || parts[1].is_empty() {
                     self.push("usage: refresh <layer>  (type 'refresh help' for details)");
                 } else {
@@ -647,10 +760,10 @@ impl Console {
                     self.push("");
                     self.push("Toggles the visibility of a named data layer.");
                     self.push("");
-                    self.push("  Available layers:  roads, railways");
+                    self.push("  Available layers:  roads  railways  rivers  lakes  railroads  topo");
                     self.push("  Examples:");
-                    self.push("    layer roads off");
-                    self.push("    layer railways on");
+                    self.push("    layer rivers off");
+                    self.push("    layer roads on");
                 } else if parts.len() < 3 {
                     self.push("usage: layer <name> on|off  (type 'layer help' for details)");
                 } else {
@@ -736,6 +849,7 @@ impl Console {
                     self.push("  geo names on|off     toggle country/state name labels");
                     self.push("  geo fill on|off      toggle polygon fill");
                     self.push("  geo borders on|off   toggle border outlines");
+                    self.push("  geo mesh on|off      toggle the globe wireframe mesh");
                     self.push("  geo back             navigate up one admin level");
                     self.push("");
                     self.push("Click a country on the globe to drill into its states.");
@@ -745,6 +859,7 @@ impl Console {
                             self.push(format!("geo names   = {}", if self.geo_names   { "on" } else { "off" }));
                             self.push(format!("geo fill    = {}", if self.geo_fill    { "on" } else { "off" }));
                             self.push(format!("geo borders = {}", if self.geo_borders { "on" } else { "off" }));
+                            self.push(format!("geo mesh    = {}", if self.geo_mesh    { "on" } else { "off" }));
                         }
                         Some("names") => {
                             match parts.get(2).copied().unwrap_or("") {
@@ -771,6 +886,15 @@ impl Console {
                                 "off" => { self.geo_borders = false; self.push("geo borders = off");
                                            return ConsoleOutput { geo_cmd: Some(GeoCmd::SetBorders(false)), ..Default::default() }; }
                                 other => { self.push(format!("usage: geo borders on|off  (got '{other}')")); }
+                            }
+                        }
+                        Some("mesh") => {
+                            match parts.get(2).copied().unwrap_or("") {
+                                "on"  => { self.geo_mesh = true;  self.push("geo mesh = on");
+                                           return ConsoleOutput { geo_cmd: Some(GeoCmd::SetMesh(true)),  ..Default::default() }; }
+                                "off" => { self.geo_mesh = false; self.push("geo mesh = off");
+                                           return ConsoleOutput { geo_cmd: Some(GeoCmd::SetMesh(false)), ..Default::default() }; }
+                                other => { self.push(format!("usage: geo mesh on|off  (got '{other}')")); }
                             }
                         }
                         Some("back") => {
@@ -901,11 +1025,15 @@ impl Console {
                     self.push("                                       el  — elasticity 0.0–1.0 (default 0.4)");
                     self.push("  camera follow aircraft <icao24>    lock onto an aircraft by ICAO24 hex");
                     self.push("  camera follow location             lock onto the device GPS position");
+                    self.push("  camera follow smoothing <0–1>      follow lag (0=instant, 1=very smooth)");
+                    self.push("  camera follow distance <r>         follow camera radius (globe radii, >1)");
                     self.push("");
                     self.push("  Examples:");
                     self.push("    camera rotate 10 0.3");
                     self.push("    camera follow aircraft a1b2c3");
                     self.push("    camera follow location");
+                    self.push("    camera follow smoothing 0.1");
+                    self.push("    camera follow distance 2.5");
                 } else {
                     return self.exec_camera(parts, settings);
                 }
@@ -986,66 +1114,6 @@ impl Console {
                 }
             }
 
-            // ── spectrum ─────────────────────────────────────────────────────
-            "spectrum" => {
-                if help {
-                    self.push("spectrum  —  RF spectrum analyzer overlay");
-                    self.push("");
-                    self.push("  spectrum               show current state");
-                    self.push("  spectrum on            enable the overlay");
-                    self.push("  spectrum off           disable the overlay");
-                    self.push("  spectrum source        list available sources");
-                    self.push("  spectrum source <src>  switch to a different source");
-                    self.push("");
-                    self.push("  Sources:");
-                    self.push("    dummy    — animated 2.4/5 GHz WiFi simulation (default)");
-                    self.push("    wifi     — live Android WiFi scan (Android only, future)");
-                    self.push("    rtlsdr   — RTL-SDR USB dongle IQ → FFT (future)");
-                } else {
-                    let sub = parts.get(1).copied().unwrap_or("");
-                    match sub {
-                        "" => {
-                            self.push("spectrum overlay: use 'spectrum on' or 'spectrum off'");
-                            self.push("type 'spectrum help' for full usage");
-                        }
-                        "on" => {
-                            self.push("spectrum: enabled");
-                            return ConsoleOutput {
-                                spectrum_cmd: Some(SpectrumCmd::SetVisible(true)),
-                                ..Default::default()
-                            };
-                        }
-                        "off" => {
-                            self.push("spectrum: disabled");
-                            return ConsoleOutput {
-                                spectrum_cmd: Some(SpectrumCmd::SetVisible(false)),
-                                ..Default::default()
-                            };
-                        }
-                        "source" => {
-                            let src = parts.get(2).copied().unwrap_or("");
-                            if src.is_empty() {
-                                self.push("available spectrum sources:");
-                                self.push("  dummy   — animated 2.4/5 GHz simulation (always available)");
-                                self.push("  wifi    — Android WiFi scan results (future)");
-                                self.push("  rtlsdr  — RTL-SDR hardware FFT (future)");
-                            } else {
-                                self.push(format!("spectrum source → {src}"));
-                                return ConsoleOutput {
-                                    spectrum_cmd: Some(SpectrumCmd::SetSource(src.to_string())),
-                                    ..Default::default()
-                                };
-                            }
-                        }
-                        other => {
-                            self.push(format!(
-                                "unknown spectrum sub-command '{other}'  (type 'spectrum help')"
-                            ));
-                        }
-                    }
-                }
-            }
-
             // ── diag ─────────────────────────────────────────────────────────
             "diag" => {
                 if help {
@@ -1114,16 +1182,12 @@ impl Console {
                     self.push("location  —  device location services");
                     self.push("");
                     self.push("  location                   show current source and last fix");
-                    self.push("  location source <name>     switch source: mock, network, native, off");
                     self.push("  location connect <url>     set WebSocket URL and switch to network");
                     self.push("  location follow on|off     lock camera to follow device position");
                     self.push("  location status            print latest lat/lon/alt/hdg/spd/acc");
+                    self.push("  location stop              stop location services");
                     self.push("");
-                    self.push("  Sources:");
-                    self.push("    mock     animated circular path (always available)");
-                    self.push("    network  WebSocket stream from companion device");
-                    self.push("    native   Android device GPS (Android only)");
-                    self.push("    off      stop location services");
+                    self.push("  Use 'source location <src>' to switch the active source.");
                 } else {
                     match parts.get(1).copied().unwrap_or("") {
                         "" => {
@@ -1131,18 +1195,6 @@ impl Console {
                                 location_cmd: Some(LocationCmd::Status),
                                 ..Default::default()
                             };
-                        }
-                        "source" => {
-                            let src = parts.get(2).copied().unwrap_or("").to_string();
-                            if src.is_empty() {
-                                self.push("usage: location source <mock|network|native|off>");
-                            } else {
-                                self.push(format!("location: source → {src}"));
-                                return ConsoleOutput {
-                                    location_cmd: Some(LocationCmd::SetSource(src)),
-                                    ..Default::default()
-                                };
-                            }
                         }
                         "connect" => {
                             let url = parts.get(2).copied().unwrap_or("").to_string();
@@ -1193,6 +1245,77 @@ impl Console {
                 }
             }
 
+            // ── aircraft ─────────────────────────────────────────────────────
+            "aircraft" => {
+                if help {
+                    self.push("aircraft  —  aircraft dot display settings");
+                    self.push("");
+                    self.push("  aircraft                     show current settings");
+                    self.push("  aircraft label <field>       set always-on label next to each dot");
+                    self.push("                                 none  callsign  type  altitude  speed  icao24");
+                    self.push("  aircraft follow on|off       enable/disable click-to-follow");
+                    self.push("");
+                    self.push("  Mouse over a dot to see full aircraft details.");
+                    self.push("  Click a dot to follow it (when follow is on).");
+                } else {
+                    match parts.get(1).copied().unwrap_or("") {
+                        "" => {
+                            self.push(format!("aircraft label  = {}", self.aircraft_label));
+                            self.push(format!("aircraft follow = {}", if self.aircraft_follow { "on" } else { "off" }));
+                        }
+                        "label" => {
+                            let field = parts.get(2).copied().unwrap_or("");
+                            const VALID: &[&str] =
+                                &["none", "callsign", "type", "altitude", "speed", "icao24"];
+                            if field.is_empty() {
+                                self.push("usage: aircraft label none|callsign|type|altitude|speed|icao24");
+                            } else if !VALID.contains(&field) {
+                                self.push(format!(
+                                    "unknown field '{field}' — valid: none, callsign, type, altitude, speed, icao24"
+                                ));
+                            } else {
+                                self.aircraft_label = field.to_string();
+                                self.push(format!("aircraft label = {field}"));
+                                return ConsoleOutput {
+                                    aircraft_cmd: Some(AircraftCmd::SetLabel(field.to_string())),
+                                    ..Default::default()
+                                };
+                            }
+                        }
+                        "follow" => {
+                            match parts.get(2).copied().unwrap_or("") {
+                                "on" => {
+                                    self.aircraft_follow = true;
+                                    self.push("aircraft follow: on");
+                                    return ConsoleOutput {
+                                        aircraft_cmd: Some(AircraftCmd::SetFollowOnClick(true)),
+                                        ..Default::default()
+                                    };
+                                }
+                                "off" => {
+                                    self.aircraft_follow = false;
+                                    self.push("aircraft follow: off");
+                                    return ConsoleOutput {
+                                        aircraft_cmd: Some(AircraftCmd::SetFollowOnClick(false)),
+                                        ..Default::default()
+                                    };
+                                }
+                                other => {
+                                    self.push(format!(
+                                        "usage: aircraft follow on|off  (got '{other}')"
+                                    ));
+                                }
+                            }
+                        }
+                        other => {
+                            self.push(format!(
+                                "unknown aircraft sub-command '{other}'  (type 'aircraft help')"
+                            ));
+                        }
+                    }
+                }
+            }
+
             // ── exit ─────────────────────────────────────────────────────────
             "exit" => {
                 self.open = false;
@@ -1232,12 +1355,343 @@ impl Console {
                 }
             }
 
+            // ── download ─────────────────────────────────────────────────────
+            "download" => {
+                return self.exec_download(&parts, help);
+            }
+
+            // ── directions ───────────────────────────────────────────────────
+            "directions" => {
+                return self.exec_directions(raw, settings, help);
+            }
+
+            // ── milsym ───────────────────────────────────────────────────────
+            "milsym" => {
+                return self.exec_milsym(&parts, settings, help);
+            }
+
+            "symbol" => {
+                return self.exec_symbol(&parts, help);
+            }
+
             other => {
                 self.push(format!("unknown command '{other}'  (type 'help')"));
             }
         }
 
         ConsoleOutput::default()
+    }
+
+    fn exec_download(&mut self, parts: &[&str], help: bool) -> ConsoleOutput {
+        if help {
+            self.push("download  —  browse and fetch GeoJSON datasets");
+            self.push("");
+            self.push("  download                      list catalog sources and cache status");
+            self.push("  download list                 same as above");
+            self.push("  download <name>               download a catalog source as a layer");
+            self.push("  download url <name> <url>     download any GeoJSON URL as a layer");
+            self.push("  download clear <name>         delete cached file and drop the layer");
+            self.push("");
+            self.push("  Point features render as × markers; lines/polygons render as outlines.");
+            self.push("  Layers can be toggled with 'topo on|off <name>' after loading.");
+            return ConsoleOutput::default();
+        }
+
+        let sub = parts.get(1).copied().unwrap_or("");
+
+        match sub {
+            // bare `download` or `download list` — show catalog
+            "" | "list" => {
+                self.push("GeoJSON catalog  (type 'download <name>' to add as a layer):");
+                self.push("");
+                for entry in crate::download::CATALOG {
+                    let status = if crate::download::is_cached(entry.name) {
+                        "cached"
+                    } else {
+                        "available"
+                    };
+                    self.push(format!(
+                        "  {:<12}  {}  [{}]",
+                        entry.name, entry.description, status
+                    ));
+                }
+            }
+
+            "url" => {
+                // parts[2] = "<name> <url>"
+                let rest = parts.get(2).copied().unwrap_or("").trim();
+                let Some((name, url)) = rest.split_once(' ') else {
+                    self.push("usage: download url <name> <url>");
+                    return ConsoleOutput::default();
+                };
+                let name = name.trim().to_string();
+                let url  = url.trim().to_string();
+                if name.is_empty() || url.is_empty() {
+                    self.push("usage: download url <name> <url>");
+                    return ConsoleOutput::default();
+                }
+                // Add optimistically to topo mirror
+                if !self.topo_layers.iter().any(|(n, _)| n == &name) {
+                    self.topo_layers.push((name.clone(), true));
+                }
+                self.push(format!("download: fetching '{name}' from {url}"));
+                return ConsoleOutput {
+                    download_cmd: Some(DownloadCmd::Fetch {
+                        name,
+                        url,
+                        cache_secs: 24 * 3600, // default 1-day cache for custom URLs
+                    }),
+                    ..Default::default()
+                };
+            }
+
+            "clear" => {
+                let name = parts.get(2).copied().unwrap_or("").trim();
+                if name.is_empty() {
+                    self.push("usage: download clear <name>");
+                    return ConsoleOutput::default();
+                }
+                self.topo_layers.retain(|(n, _)| n != name);
+                self.push(format!("download: cleared '{name}'"));
+                return ConsoleOutput {
+                    download_cmd: Some(DownloadCmd::Clear(name.to_string())),
+                    ..Default::default()
+                };
+            }
+
+            // Named catalog entry
+            name => {
+                match crate::download::find(name) {
+                    Some(entry) => {
+                        let status = if crate::download::is_cached(entry.name) {
+                            "loading from cache"
+                        } else {
+                            "downloading…"
+                        };
+                        self.push(format!("download: '{}' — {status}", entry.name));
+                        if !self.topo_layers.iter().any(|(n, _)| n == entry.name) {
+                            self.topo_layers.push((entry.name.to_string(), true));
+                        }
+                        return ConsoleOutput {
+                            download_cmd: Some(DownloadCmd::Fetch {
+                                name:       entry.name.to_string(),
+                                url:        entry.url.to_string(),
+                                cache_secs: entry.cache_secs,
+                            }),
+                            ..Default::default()
+                        };
+                    }
+                    None => {
+                        self.push(format!("download: unknown source '{name}'"));
+                        self.push("  type 'download list' to see available sources");
+                    }
+                }
+            }
+        }
+
+        ConsoleOutput::default()
+    }
+
+    /// Handle `directions [<from> to <to>]`
+    fn exec_directions(&mut self, raw: &str, settings: &Settings, help: bool) -> ConsoleOutput {
+        if help {
+            self.push("directions <from> to <to>");
+            self.push("");
+            self.push("Fetch a driving route and render it on the globe.");
+            self.push("Both endpoints can be GPS coordinates or a place name.");
+            self.push("");
+            self.push("  Separators: 'to'  or  '|'");
+            self.push("");
+            self.push("  Examples:");
+            self.push("    directions San Francisco to Los Angeles");
+            self.push("    directions 37.7749,-122.4194 to 34.0522,-118.2437");
+            self.push("    directions JFK | LAX");
+            self.push("");
+            self.push("  Switch routing source:");
+            self.push("    source directions osrm    (free, no auth)");
+            self.push("    source directions google  (requires google_maps_api_key)");
+            self.push("");
+            self.push("  Remove route:  topo drop directions");
+            return ConsoleOutput::default();
+        }
+
+        // Strip the command name, leaving "from <sep> to"
+        let rest = raw.strip_prefix("directions").unwrap_or("").trim();
+
+        if rest.is_empty() {
+            self.push(format!("directions source: {}", settings.directions_source));
+            self.push("usage: directions <from> to <to>   (type 'directions help' for details)");
+            return ConsoleOutput::default();
+        }
+
+        // Parse separators: " to " (case-insensitive) then "|" then single space
+        let (from, to) = if let Some(i) = rest.to_lowercase().find(" to ") {
+            (&rest[..i], &rest[i + 4..])
+        } else if let Some((a, b)) = rest.split_once('|') {
+            (a, b)
+        } else if let Some((a, b)) = rest.split_once(' ') {
+            (a, b)
+        } else {
+            self.push("usage: directions <from> to <to>   (type 'directions help' for details)");
+            return ConsoleOutput::default();
+        };
+
+        let from = from.trim().to_string();
+        let to   = to.trim().to_string();
+
+        if from.is_empty() || to.is_empty() {
+            self.push("usage: directions <from> to <to>   (type 'directions help' for details)");
+            return ConsoleOutput::default();
+        }
+
+        self.push(format!("directions: {from} → {to}  (fetching…)"));
+        ConsoleOutput {
+            directions_cmd: Some(DirectionsCmd::Fetch { from, to }),
+            ..Default::default()
+        }
+    }
+
+    fn exec_milsym(&mut self, parts: &[&str], settings: &Settings, help: bool) -> ConsoleOutput {
+        if help {
+            self.push("milsym  —  MIL-STD-2525D military symbology overlay");
+            self.push("");
+            self.push("  milsym                  show current configuration");
+            self.push("  milsym on|off            enable or disable symbology mode");
+            self.push("  milsym scale <f>         symbol size multiplier (default 1.0)");
+            self.push("  milsym echelon on|off    show/hide echelon indicator above frame");
+            self.push("  milsym affiliation civil|military|unknown <friend|hostile|neutral|unknown>");
+            self.push("");
+            self.push("  Affiliations:  friend (blue rect)  hostile (red diamond)");
+            self.push("                 neutral (green sq)   unknown (yellow circle)");
+            self.push("");
+            self.push("  Default mapping: single/multi-engine → friend, military → hostile,");
+            self.push("                   misc/balloon        → unknown");
+            return ConsoleOutput::default();
+        }
+
+        let sub = parts.get(1).copied().unwrap_or("");
+
+        match sub {
+            "" => {
+                self.push(format!(
+                    "milsym  enabled={}  scale={}  echelon={}",
+                    if settings.milsym_enabled { "on" } else { "off" },
+                    settings.milsym_scale,
+                    if settings.milsym_show_echelon { "on" } else { "off" },
+                ));
+                self.push(format!(
+                    "  civil→{}  military→{}  unknown→{}",
+                    settings.milsym_civil_affiliation,
+                    settings.milsym_military_affiliation,
+                    settings.milsym_unknown_affiliation,
+                ));
+                self.push("  icon size scales with zoom — adjust with: milsym scale <0.5…2.0>");
+                ConsoleOutput::default()
+            }
+            "on" | "off" => ConsoleOutput {
+                milsym_cmd: Some(MilsymCmd::SetEnabled(sub == "on")),
+                ..Default::default()
+            },
+            "scale" => {
+                let v = parts.get(2).copied().unwrap_or("");
+                match v.parse::<f32>() {
+                    Ok(f) if f > 0.0 => ConsoleOutput {
+                        milsym_cmd: Some(MilsymCmd::SetScale(f)),
+                        ..Default::default()
+                    },
+                    Ok(_) => { self.push("error: scale must be > 0"); ConsoleOutput::default() }
+                    Err(_) => { self.push("usage: milsym scale <number>"); ConsoleOutput::default() }
+                }
+            }
+            "echelon" => {
+                match parts.get(2).copied().unwrap_or("") {
+                    "on"  => ConsoleOutput { milsym_cmd: Some(MilsymCmd::SetEchelon(true)),  ..Default::default() },
+                    "off" => ConsoleOutput { milsym_cmd: Some(MilsymCmd::SetEchelon(false)), ..Default::default() },
+                    _     => { self.push("usage: milsym echelon on|off"); ConsoleOutput::default() }
+                }
+            }
+            "affiliation" => {
+                let entity      = parts.get(2).copied().unwrap_or("").to_string();
+                let affiliation = parts.get(3).copied().unwrap_or("").to_string();
+                if matches!(entity.as_str(), "civil" | "military" | "unknown")
+                    && matches!(affiliation.as_str(), "friend" | "hostile" | "neutral" | "unknown")
+                {
+                    ConsoleOutput {
+                        milsym_cmd: Some(MilsymCmd::SetAffiliation { entity, affiliation }),
+                        ..Default::default()
+                    }
+                } else {
+                    self.push("usage: milsym affiliation civil|military|unknown friend|hostile|neutral|unknown");
+                    ConsoleOutput::default()
+                }
+            }
+            _ => {
+                self.push("usage: milsym [on|off] [scale <f>] [echelon on|off] [affiliation …]");
+                self.push("type 'milsym help' for details");
+                ConsoleOutput::default()
+            }
+        }
+    }
+
+    /// Handle `symbol <sub> [args…]`
+    fn exec_symbol(&mut self, parts: &[&str], help: bool) -> ConsoleOutput {
+        if help || parts.get(1).copied().unwrap_or("") == "help" {
+            self.push("symbol assign <key> <path>   — load SVG file and assign to icon key");
+            self.push("symbol clear <key>           — remove SVG assignment (reverts to built-in)");
+            self.push("symbol standard <id>         — switch active standard: app6a | milstd2525d");
+            self.push("symbol list                  — list all keys with loaded/missing status");
+            self.push("");
+            self.push("  Keys: air.fixed_wing  air.rotary  air.fighter  air.bomber  air.tanker");
+            self.push("        air.transport  air.unmanned  air.military_fixed_wing  air.generic");
+            self.push("        ground.infantry  ground.armor  ground.artillery  ground.mechanized_infantry");
+            self.push("        ground.anti_aircraft  ground.engineer  ground.hq  ground.reconnaissance");
+            self.push("        ground.special_forces  ground.generic");
+            self.push("        naval.surface  naval.submarine  naval.carrier  naval.generic");
+            return ConsoleOutput::default();
+        }
+
+        let sub = parts.get(1).copied().unwrap_or("");
+        match sub {
+            "assign" => {
+                // parts[2] = "<key> <path>" (execute() uses splitn(3))
+                let rest = parts.get(2).copied().unwrap_or("");
+                let (key, path) = rest.split_once(' ')
+                    .map(|(k, p)| (k.trim(), p.trim()))
+                    .unwrap_or((rest, ""));
+                if key.is_empty() || path.is_empty() {
+                    self.push("usage: symbol assign <key> <path>");
+                    ConsoleOutput::default()
+                } else {
+                    ConsoleOutput {
+                        symbol_cmd: Some(SymbolCmd::Assign { key: key.to_string(), path: path.to_string() }),
+                        ..Default::default()
+                    }
+                }
+            }
+            "clear" => {
+                let key = parts.get(2).copied().unwrap_or("").to_string();
+                if key.is_empty() {
+                    self.push("usage: symbol clear <key>");
+                    ConsoleOutput::default()
+                } else {
+                    ConsoleOutput { symbol_cmd: Some(SymbolCmd::Clear(key)), ..Default::default() }
+                }
+            }
+            "standard" => {
+                let id = parts.get(2).copied().unwrap_or("").to_string();
+                if id.is_empty() {
+                    self.push("usage: symbol standard app6a|milstd2525d");
+                    ConsoleOutput::default()
+                } else {
+                    ConsoleOutput { symbol_cmd: Some(SymbolCmd::SetStandard(id)), ..Default::default() }
+                }
+            }
+            "list" | "" => ConsoleOutput { symbol_cmd: Some(SymbolCmd::List), ..Default::default() },
+            _ => {
+                self.push("usage: symbol assign|clear|standard|list  (type 'symbol help')");
+                ConsoleOutput::default()
+            }
+        }
     }
 
     /// Handle `camera <sub> [args…]`
@@ -1292,9 +1746,61 @@ impl Console {
                             settings.follow_smoothing, settings.follow_distance,
                         ));
                     }
+                    "smoothing" => {
+                        if arg.is_empty() {
+                            self.push(format!("follow_smoothing = {}", settings.follow_smoothing));
+                        } else {
+                            let msg = settings.set("follow_smoothing", arg);
+                            settings.save();
+                            self.push(msg);
+                        }
+                    }
+                    "distance" => {
+                        if arg.is_empty() {
+                            self.push(format!("follow_distance = {}", settings.follow_distance));
+                        } else {
+                            let msg = settings.set("follow_distance", arg);
+                            settings.save();
+                            self.push(msg);
+                        }
+                    }
                     _ => {
                         self.push("usage: camera follow aircraft <icao24>  |  camera follow location");
+                        self.push("       camera follow smoothing <0–1>    |  camera follow distance <r>");
                         self.push("type 'camera help' for details");
+                    }
+                }
+            }
+
+            "overlay" => {
+                let rest = parts.get(2).copied().unwrap_or("");
+                let mut it = rest.splitn(2, ' ');
+                let sub2 = it.next().unwrap_or("");
+                let arg2 = it.next().unwrap_or("").trim();
+                match sub2 {
+                    "" => {
+                        self.push(format!("follow_overlay        = {}", settings.get("follow_overlay")));
+                        self.push(format!("follow_overlay_fields = {}", settings.get("follow_overlay_fields")));
+                        self.push("  available fields: callsign  icao24  type  category");
+                        self.push("                    altitude  speed  heading  position  on_ground");
+                    }
+                    "on" | "off" => {
+                        let msg = settings.set("follow_overlay", sub2);
+                        settings.save();
+                        self.push(msg);
+                    }
+                    "fields" => {
+                        if arg2.is_empty() {
+                            self.push(format!("follow_overlay_fields = {}", settings.follow_overlay_fields));
+                        } else {
+                            let msg = settings.set("follow_overlay_fields", arg2);
+                            settings.save();
+                            self.push(msg);
+                        }
+                    }
+                    _ => {
+                        self.push("usage: camera overlay [on|off|fields <field,...>]");
+                        self.push("  e.g.  camera overlay fields callsign,altitude,speed");
                     }
                 }
             }

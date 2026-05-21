@@ -110,7 +110,7 @@ impl CameraAnimator {
 
                     camera.yaw    = lerp_angle(camera.yaw, t_yaw, factor);
                     camera.pitch  = lerp(camera.pitch,  t_pitch,  factor);
-                    camera.radius = lerp(camera.radius, distance, factor * 0.5);
+                    camera.radius = lerp(camera.radius, distance, factor);
                     self.yaw_vel  = 0.0;
                 }
             }

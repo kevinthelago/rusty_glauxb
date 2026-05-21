@@ -15,7 +15,7 @@ pub enum FlightSource {
 }
 
 impl Default for FlightSource {
-    fn default() -> Self { Self::AdsbFi }
+    fn default() -> Self { Self::OpenSky }
 }
 
 impl fmt::Display for FlightSource {
@@ -67,6 +67,36 @@ pub struct Settings {
     pub follow_smoothing:  f32,
     /// Camera radius (globe radii) while following.
     pub follow_distance:   f32,
+
+    // ── Follow overlay ────────────────────────────────────────────────────────
+    /// Show the HUD info panel while following an entity.
+    pub follow_overlay:        bool,
+    /// Comma-separated list of fields shown in the overlay.
+    pub follow_overlay_fields: String,
+
+    // ── Drag interrupt / idle resume ──────────────────────────────────────────
+    /// Seconds of idle after a drag before the default animation is restored.
+    /// 0.0 = never auto-resume.
+    pub idle_resume_secs: f32,
+
+    // ── Directions routing ────────────────────────────────────────────────────
+    /// Active routing source: "osrm" or "google".
+    pub directions_source:   String,
+    pub google_maps_api_key: Option<String>,
+
+    // ── Military symbology ────────────────────────────────────────────────────
+    /// Replace entity dots with MIL-STD-2525D symbols.
+    pub milsym_enabled:              bool,
+    /// Scale multiplier for symbol size (1.0 = default ~20px frame).
+    pub milsym_scale:                f32,
+    /// Show echelon indicator above the frame.
+    pub milsym_show_echelon:         bool,
+    /// Affiliation assigned to civil aircraft (single_engine / multi_engine).
+    pub milsym_civil_affiliation:    String,
+    /// Affiliation assigned to military aircraft.
+    pub milsym_military_affiliation: String,
+    /// Affiliation assigned to aircraft with unknown/misc category.
+    pub milsym_unknown_affiliation:  String,
 }
 
 impl Default for Settings {
@@ -83,8 +113,23 @@ impl Default for Settings {
             rotate_speed:      10.0,
             rotate_elasticity: 0.4,
             follow_entity:     String::new(),
-            follow_smoothing:  0.5,
+            follow_smoothing:  0.15,
             follow_distance:   3.0,
+
+            follow_overlay:        true,
+            follow_overlay_fields: "callsign,type,altitude,speed,heading,position".into(),
+
+            idle_resume_secs: 30.0,
+
+            directions_source:   "osrm".into(),
+            google_maps_api_key: None,
+
+            milsym_enabled:              false,
+            milsym_scale:                1.0,
+            milsym_show_echelon:         true,
+            milsym_civil_affiliation:    "friend".into(),
+            milsym_military_affiliation: "hostile".into(),
+            milsym_unknown_affiliation:  "unknown".into(),
         }
     }
 }
@@ -191,6 +236,66 @@ impl Settings {
                 Ok(_)  => "error: must be > 1.0".into(),
                 Err(e) => format!("error: {e}"),
             },
+            "follow_overlay" => match value {
+                "on"  | "true"  | "1" => { self.follow_overlay = true;  "follow_overlay = on".into() }
+                "off" | "false" | "0" => { self.follow_overlay = false; "follow_overlay = off".into() }
+                _ => "error: expected on or off".into(),
+            },
+            "follow_overlay_fields" => {
+                // Accept space- or comma-separated; store normalised as comma-separated.
+                let normalised: String = value
+                    .split(|c: char| c == ',' || c == ' ')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                self.follow_overlay_fields = normalised.clone();
+                format!("follow_overlay_fields = {normalised}")
+            }
+            "idle_resume_secs" => match value.parse::<f32>() {
+                Ok(v) if v >= 0.0 => { self.idle_resume_secs = v; format!("idle_resume_secs = {v}") }
+                Ok(_)  => "error: must be >= 0".into(),
+                Err(e) => format!("error: {e}"),
+            },
+
+            // ── Directions ───────────────────────────────────────────────────
+            "directions_source" => match value {
+                "osrm" | "google" => { self.directions_source = value.into(); format!("directions_source = {value}") }
+                _ => "error: expected osrm or google".into(),
+            },
+            "google_maps_api_key" => {
+                self.google_maps_api_key = non_empty(value);
+                "google_maps_api_key = ***".into()
+            }
+
+            // ── Milsym ───────────────────────────────────────────────────────
+            "milsym_enabled" => match value {
+                "on"  | "true"  | "1" => { self.milsym_enabled = true;  "milsym_enabled = on".into() }
+                "off" | "false" | "0" => { self.milsym_enabled = false; "milsym_enabled = off".into() }
+                _ => "error: expected on or off".into(),
+            },
+            "milsym_scale" => match value.parse::<f32>() {
+                Ok(v) if v > 0.0 => { self.milsym_scale = v; format!("milsym_scale = {v}") }
+                Ok(_)  => "error: must be > 0".into(),
+                Err(e) => format!("error: {e}"),
+            },
+            "milsym_show_echelon" => match value {
+                "on"  | "true"  | "1" => { self.milsym_show_echelon = true;  "milsym_show_echelon = on".into() }
+                "off" | "false" | "0" => { self.milsym_show_echelon = false; "milsym_show_echelon = off".into() }
+                _ => "error: expected on or off".into(),
+            },
+            "milsym_civil_affiliation" => {
+                self.milsym_civil_affiliation = value.into();
+                format!("milsym_civil_affiliation = {value}")
+            }
+            "milsym_military_affiliation" => {
+                self.milsym_military_affiliation = value.into();
+                format!("milsym_military_affiliation = {value}")
+            }
+            "milsym_unknown_affiliation" => {
+                self.milsym_unknown_affiliation = value.into();
+                format!("milsym_unknown_affiliation = {value}")
+            }
 
             _ => format!("unknown key: {key}"),
         }
@@ -208,9 +313,20 @@ impl Settings {
             "rotate_speed"        => self.rotate_speed.to_string(),
             "rotate_elasticity"   => self.rotate_elasticity.to_string(),
             "follow_entity"       => self.follow_entity.clone(),
-            "follow_smoothing"    => self.follow_smoothing.to_string(),
-            "follow_distance"     => self.follow_distance.to_string(),
-            _                     => format!("unknown key: {key}"),
+            "follow_smoothing"       => self.follow_smoothing.to_string(),
+            "follow_distance"        => self.follow_distance.to_string(),
+            "follow_overlay"         => if self.follow_overlay { "on".into() } else { "off".into() },
+            "follow_overlay_fields"  => self.follow_overlay_fields.clone(),
+            "idle_resume_secs"       => self.idle_resume_secs.to_string(),
+            "directions_source"      => self.directions_source.clone(),
+            "google_maps_api_key"    => masked(&self.google_maps_api_key),
+            "milsym_enabled"              => if self.milsym_enabled { "on".into() } else { "off".into() },
+            "milsym_scale"                => self.milsym_scale.to_string(),
+            "milsym_show_echelon"         => if self.milsym_show_echelon { "on".into() } else { "off".into() },
+            "milsym_civil_affiliation"    => self.milsym_civil_affiliation.clone(),
+            "milsym_military_affiliation" => self.milsym_military_affiliation.clone(),
+            "milsym_unknown_affiliation"  => self.milsym_unknown_affiliation.clone(),
+            _                        => format!("unknown key: {key}"),
         }
     }
 
@@ -228,6 +344,17 @@ impl Settings {
             "follow_entity",
             "follow_smoothing",
             "follow_distance",
+            "follow_overlay",
+            "follow_overlay_fields",
+            "idle_resume_secs",
+            "directions_source",
+            "google_maps_api_key",
+            "milsym_enabled",
+            "milsym_scale",
+            "milsym_show_echelon",
+            "milsym_civil_affiliation",
+            "milsym_military_affiliation",
+            "milsym_unknown_affiliation",
         ]
     }
 }

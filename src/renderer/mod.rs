@@ -17,6 +17,7 @@ use crate::{
     hud::Hud,
     layers::LayerManager,
     settings::Settings,
+    tile::{LodLevel, TileGrid, TileSet},
 };
 
 // ─── Render output ────────────────────────────────────────────────────────────
@@ -25,17 +26,17 @@ use crate::{
 /// with per-frame diagnostic counters consumed by `DiagCollector`.
 #[derive(Default)]
 pub struct RenderOutput {
-    pub console:    ConsoleOutput,
-    pub gpu_ms:     Option<f64>,
-    pub draw_calls: u32,
-    pub tri_count:  u32,
+    pub console:         ConsoleOutput,
+    pub gpu_ms:          Option<f64>,
+    pub draw_calls:      u32,
+    pub tri_count:       u32,
+    /// ICAO24 of an aircraft the user clicked this frame (for follow mode).
+    pub follow_aircraft: Option<String>,
 }
 
-use aircraft::AircraftRenderer;
 use lines::{draw_layer, LineLayer, LinePipeline};
 use polygons::{draw_world_map, WorldMapLayer, WorldMapPipeline};
 
-const GLOBE_SUBDIVISIONS: u32 = 64;
 pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 // ─── Uniforms ────────────────────────────────────────────────────────────────
@@ -47,33 +48,48 @@ struct GlobeUniforms {
     model:     [[f32; 4]; 4], // 64 bytes
 }
 
-// ─── Globe render pipeline ────────────────────────────────────────────────────
+// ─── Per-LOD mesh buffers ────────────────────────────────────────────────────
 
-struct GlobePipeline {
-    pipeline:    wgpu::RenderPipeline,
+struct LodMesh {
     vertex_buf:  wgpu::Buffer,
     index_buf:   wgpu::Buffer,
     index_count: u32,
-    uniform_buf: wgpu::Buffer,
-    bind_group:  wgpu::BindGroup,
 }
 
-impl GlobePipeline {
-    fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
-        let mesh = CubeSphere::new(GLOBE_SUBDIVISIONS);
-
+impl LodMesh {
+    fn new(device: &wgpu::Device, subdivisions: u32) -> Self {
+        let mesh = CubeSphere::new(subdivisions);
         let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label:    Some("globe:verts"),
+            label:    Some(&format!("globe:verts:lod{subdivisions}")),
             contents: bytemuck::cast_slice(&mesh.vertices),
             usage:    wgpu::BufferUsages::VERTEX,
         });
         let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label:    Some("globe:idx"),
+            label:    Some(&format!("globe:idx:lod{subdivisions}")),
             contents: bytemuck::cast_slice(&mesh.indices),
             usage:    wgpu::BufferUsages::INDEX,
         });
-        let index_count = mesh.indices.len() as u32;
+        Self { vertex_buf, index_buf, index_count: mesh.indices.len() as u32 }
+    }
+}
 
+// ─── Globe render pipeline ────────────────────────────────────────────────────
+
+/// Shared pipeline + uniforms; mesh buffers are swapped per LOD level each frame.
+struct GlobePipeline {
+    /// Depth-only solid fill: always runs, stamps the globe silhouette into the
+    /// depth buffer so back-side line layers are correctly occluded.
+    depth_pipeline: wgpu::RenderPipeline,
+    /// Optional wireframe overlay rendered on top of the depth fill.
+    pipeline:    wgpu::RenderPipeline,
+    uniform_buf: wgpu::Buffer,
+    bind_group:  wgpu::BindGroup,
+    /// LOD meshes indexed by `LodLevel as usize` (0 = Overview … 3 = Full).
+    lod_meshes:  [LodMesh; 4],
+}
+
+impl GlobePipeline {
+    fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label:              Some("globe:uniforms"),
             size:               std::mem::size_of::<GlobeUniforms>() as u64,
@@ -115,6 +131,50 @@ impl GlobePipeline {
             push_constant_ranges: &[],
         });
 
+        // Depth-only solid pass: fills the globe silhouette in the depth buffer
+        // so that lines behind the globe are correctly occluded regardless of the
+        // wireframe's sparse coverage.  Never writes color.
+        let depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label:  Some("globe:depth"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module:               &shader,
+                entry_point:          "vs_main",
+                buffers:              &[GlobeVertex::layout()],
+                compilation_options:  Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module:              &shader,
+                entry_point:         "fs_main",
+                targets:             &[Some(wgpu::ColorTargetState {
+                    format:     surface_format,
+                    blend:      None,
+                    write_mask: wgpu::ColorWrites::empty(),  // depth only
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology:   wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode:  Some(wgpu::Face::Back),
+                // Fill mode — no feature flag required.
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format:              DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare:       wgpu::CompareFunction::Less,
+                stencil:             wgpu::StencilState::default(),
+                bias:                wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview:   None,
+            cache:       None,
+        });
+
+        // Wireframe overlay rendered on top of the depth fill.
+        // Uses LessEqual so it passes the depth test against the values the
+        // depth pass just wrote (same geometry → identical depths).
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label:  Some("globe"),
             layout: Some(&layout),
@@ -142,18 +202,27 @@ impl GlobePipeline {
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format:               DEPTH_FORMAT,
-                depth_write_enabled:  true,
-                depth_compare:        wgpu::CompareFunction::Less,
-                stencil:              wgpu::StencilState::default(),
-                bias:                 wgpu::DepthBiasState::default(),
+                format:              DEPTH_FORMAT,
+                depth_write_enabled: false,          // depth fill pass already wrote it
+                depth_compare:       wgpu::CompareFunction::LessEqual,
+                stencil:             wgpu::StencilState::default(),
+                bias:                wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
             multiview:   None,
             cache:       None,
         });
 
-        Self { pipeline, vertex_buf, index_buf, index_count, uniform_buf, bind_group }
+        // Pre-build all LOD meshes at startup.  Total VRAM cost is modest:
+        // 8+16+32+64 subdivisions → ~410 KB combined vertex + index data.
+        let lod_meshes = [
+            LodMesh::new(device, LodLevel::Overview.mesh_subdivisions()),
+            LodMesh::new(device, LodLevel::Coarse.mesh_subdivisions()),
+            LodMesh::new(device, LodLevel::Medium.mesh_subdivisions()),
+            LodMesh::new(device, LodLevel::Full.mesh_subdivisions()),
+        ];
+
+        Self { depth_pipeline, pipeline, uniform_buf, bind_group, lod_meshes }
     }
 
     fn update_uniforms(&self, queue: &wgpu::Queue, view_proj: Mat4, model: Mat4) {
@@ -162,6 +231,11 @@ impl GlobePipeline {
             model:     model.to_cols_array_2d(),
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&data));
+    }
+
+    /// Active mesh for the given LOD.
+    fn mesh(&self, lod: LodLevel) -> &LodMesh {
+        &self.lod_meshes[lod as usize]
     }
 }
 
@@ -176,12 +250,15 @@ pub struct WgpuState {
     depth_view:   wgpu::TextureView,
     globe:        GlobePipeline,
     pub camera:   ArcballCamera,
-    aircraft:     AircraftRenderer,
     /// Shared compiled line pipeline (one shader for all line layers).
     line_pipeline:      LinePipeline,
     /// Each `LineLayer` is independently toggleable via `.visible`.
     pub roads:          LineLayer,
     pub railways:       LineLayer,
+    /// Auto-loaded Natural Earth datasets.
+    pub rivers:         LineLayer,
+    pub lakes:          LineLayer,
+    pub railroads:      LineLayer,
     /// Dynamically loaded GeoJSON topology layers (one per `topo load` command).
     pub topo_layers:    Vec<LineLayer>,
     /// World-map polygon pipeline + per-level layers.
@@ -194,6 +271,14 @@ pub struct WgpuState {
     gpu_timer:    Option<GpuTimer>,
     /// Adapter capabilities exposed to DiagCollector.
     pub adapter_caps: AdapterCaps,
+    /// Precomputed tile grid — built once at startup.
+    tile_grid:     TileGrid,
+    /// Tiles determined to be visible this frame.
+    visible_tiles: TileSet,
+    /// Current LOD level driven by camera distance.
+    pub lod:       LodLevel,
+    /// When false the globe wireframe mesh draw call is skipped entirely.
+    pub globe_mesh_visible: bool,
 }
 
 impl WgpuState {
@@ -266,12 +351,14 @@ impl WgpuState {
         };
         surface.configure(&device, &config);
 
-        let depth_view        = make_depth_view(&device, config.width, config.height);
-        let globe             = GlobePipeline::new(&device, surface_format);
-        let aircraft          = AircraftRenderer::new(&device, surface_format);
-        let line_pipeline     = LinePipeline::new(&device, surface_format);
-        let roads    = LineLayer::new(&device, &line_pipeline.bgl, "roads",    [1.00, 0.85, 0.30, 0.85]);
-        let railways = LineLayer::new(&device, &line_pipeline.bgl, "railways", [0.45, 0.80, 1.00, 0.85]);
+        let depth_view    = make_depth_view(&device, config.width, config.height);
+        let globe         = GlobePipeline::new(&device, surface_format);
+        let line_pipeline = LinePipeline::new(&device, surface_format);
+        let roads     = LineLayer::new_with_lod(&device, &line_pipeline.bgl, "roads",     [1.00, 0.85, 0.30, 0.85], LodLevel::Full);
+        let railways  = LineLayer::new_with_lod(&device, &line_pipeline.bgl, "railways",  [0.45, 0.80, 1.00, 0.85], LodLevel::Full);
+        let rivers    = LineLayer::new_with_lod(&device, &line_pipeline.bgl, "rivers",    [0.20, 0.55, 1.00, 0.75], LodLevel::Medium);
+        let lakes     = LineLayer::new_with_lod(&device, &line_pipeline.bgl, "lakes",     [0.25, 0.65, 1.00, 0.65], LodLevel::Medium);
+        let railroads = LineLayer::new_with_lod(&device, &line_pipeline.bgl, "railroads", [0.60, 0.48, 0.35, 0.80], LodLevel::Full);
         let world_map_pipeline = WorldMapPipeline::new(&device, surface_format);
         let world_map = WorldMapLayer::new(
             &device,
@@ -282,6 +369,7 @@ impl WgpuState {
         );
 
         let egui_ctx = egui::Context::default();
+        crate::fonts::configure(&egui_ctx);
         let egui_winit = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -304,10 +392,12 @@ impl WgpuState {
             depth_view,
             globe,
             camera,
-            aircraft,
             line_pipeline,
             roads,
             railways,
+            rivers,
+            lakes,
+            railroads,
             topo_layers: Vec::new(),
             world_map_pipeline,
             world_map,
@@ -316,6 +406,10 @@ impl WgpuState {
             egui_renderer,
             gpu_timer,
             adapter_caps,
+            tile_grid:          TileGrid::new(),
+            visible_tiles:      TileSet::empty(),
+            lod:                LodLevel::Full,
+            globe_mesh_visible: true,
         }
     }
 
@@ -338,26 +432,71 @@ impl WgpuState {
     pub fn zoom(&mut self, delta: f32)         { self.camera.zoom(delta);  }
 
     /// Geographic bounding box of the currently visible globe region.
-    /// Feed this into [`crate::pipeline::PipelineManager::tick`] each frame.
+    ///
+    /// Returns the union of all visible tile bounds — a frustum-tight box that
+    /// is significantly smaller than the old hemisphere-cap approximation.
+    /// Falls back to the hemisphere cap when no tiles are visible (e.g. during
+    /// the first frame before tile visibility has been computed).
     pub fn geo_bounds(&self) -> GeoBounds {
-        GeoBounds::from_eye(self.camera.eye())
+        if self.visible_tiles.is_empty() {
+            GeoBounds::from_eye(self.camera.eye())
+        } else {
+            self.tile_grid.geo_bounds_for(&self.visible_tiles)
+        }
     }
 
-    /// View-frustum for the current frame.  Pass to culling helpers when
-    /// building instance buffers for data-layer points.
-    #[allow(dead_code)]
-    pub fn frustum(&self) -> Frustum {
-        Frustum::from_view_proj(self.camera.view_proj())
+    /// Compute tile visibility and LOD for the current frame, then cull all
+    /// line layers to the new visible set.
+    ///
+    /// Call once per frame before [`render`].  Replaces the old
+    /// `cull_line_layers()` / hemisphere-dot-product approach.
+    pub fn update_visibility(&mut self) {
+        let eye     = self.camera.eye();
+        let frustum = Frustum::from_view_proj(self.camera.view_proj());
+        let lod     = LodLevel::from_radius(eye.length());
+
+        let new_tiles = self.tile_grid.visible_tiles(&frustum, eye);
+
+        // Only rebuild line-layer vertex buffers when the visible tile set
+        // actually changes — not on every camera micro-movement.
+        let tiles_changed = !new_tiles.same_as(&self.visible_tiles);
+        let lod_changed   = lod != self.lod;
+
+        self.visible_tiles = new_tiles;
+        self.lod           = lod;
+
+        if tiles_changed || lod_changed {
+            self.roads.cull_to_tiles(&self.device, &self.visible_tiles, self.lod);
+            self.railways.cull_to_tiles(&self.device, &self.visible_tiles, self.lod);
+            self.rivers.cull_to_tiles(&self.device, &self.visible_tiles, self.lod);
+            self.lakes.cull_to_tiles(&self.device, &self.visible_tiles, self.lod);
+            self.railroads.cull_to_tiles(&self.device, &self.visible_tiles, self.lod);
+            for layer in &mut self.topo_layers {
+                layer.cull_to_tiles(&self.device, &self.visible_tiles, self.lod);
+            }
+        }
     }
 
     /// Rebuild road vertex buffer when new data arrives from the watch channel.
     pub fn update_roads(&mut self, features: &[GeoFeature]) {
-        self.roads.update(&self.device, features);
+        self.roads.update(&self.device, features, &self.tile_grid);
     }
 
     /// Rebuild railway vertex buffer when new data arrives from the watch channel.
     pub fn update_railways(&mut self, features: &[GeoFeature]) {
-        self.railways.update(&self.device, features);
+        self.railways.update(&self.device, features, &self.tile_grid);
+    }
+
+    pub fn update_rivers(&mut self, features: &[GeoFeature]) {
+        self.rivers.update(&self.device, features, &self.tile_grid);
+    }
+
+    pub fn update_lakes(&mut self, features: &[GeoFeature]) {
+        self.lakes.update(&self.device, features, &self.tile_grid);
+    }
+
+    pub fn update_railroads(&mut self, features: &[GeoFeature]) {
+        self.railroads.update(&self.device, features, &self.tile_grid);
     }
 
     /// Color palette cycled through as new topo layers are added.
@@ -373,16 +512,32 @@ impl WgpuState {
         PALETTE[index % PALETTE.len()]
     }
 
+    /// Load (or reload) a named topology layer from an in-memory feature list.
+    /// Used by the async download pipeline and the directions system.
+    pub fn load_topo_data(&mut self, name: &str, features: Vec<crate::geo::GeoFeature>) {
+        if let Some(idx) = self.topo_layers.iter().position(|l| l.name == name) {
+            self.topo_layers[idx].update(&self.device, &features, &self.tile_grid);
+        } else {
+            let color = match name {
+                "directions" => [0.10, 1.00, 0.45, 1.00],
+                _            => Self::topo_color(self.topo_layers.len()),
+            };
+            let mut layer = LineLayer::new(&self.device, &self.line_pipeline.bgl, name, color);
+            layer.update(&self.device, &features, &self.tile_grid);
+            self.topo_layers.push(layer);
+        }
+    }
+
     /// Load (or reload) a named GeoJSON topology layer.
     pub fn load_topo(&mut self, name: &str, path: &str) {
         match crate::topo::load_geojson(std::path::Path::new(path)) {
             Ok(features) => {
-                if let Some(layer) = self.topo_layers.iter_mut().find(|l| l.name == name) {
-                    layer.update(&self.device, &features);
+                if let Some(idx) = self.topo_layers.iter().position(|l| l.name == name) {
+                    self.topo_layers[idx].update(&self.device, &features, &self.tile_grid);
                 } else {
                     let color = Self::topo_color(self.topo_layers.len());
                     let mut layer = LineLayer::new(&self.device, &self.line_pipeline.bgl, name, color);
-                    layer.update(&self.device, &features);
+                    layer.update(&self.device, &features, &self.tile_grid);
                     self.topo_layers.push(layer);
                 }
             }
@@ -413,11 +568,15 @@ impl WgpuState {
     }
 
     /// Project a geographic coordinate to a screen-space pixel position.
-    /// Returns `None` when the point is behind the camera or outside the NDC cube.
+    /// Returns `None` when the point is behind the globe or outside the NDC cube.
     pub fn project_geo(&self, lat: f32, lon: f32) -> Option<egui::Pos2> {
         use crate::geo::geo_to_cartesian;
         use glam::Vec4;
         let world = geo_to_cartesian(lat, lon);
+        // On a unit sphere the surface normal IS the position vector.
+        // A point is geometrically visible from the camera iff world·eye > 1
+        // (the exact silhouette condition for a unit sphere at the origin).
+        if world.dot(self.camera.eye()) <= 1.0 { return None; }
         let clip  = self.camera.view_proj() * Vec4::new(world.x, world.y, world.z, 1.0);
         if clip.w <= 0.0 { return None; }
         let nx = clip.x / clip.w;
@@ -521,30 +680,124 @@ impl WgpuState {
                 occlusion_query_set: None,
             });
 
-            pass.set_pipeline(&self.globe.pipeline);
-            pass.set_bind_group(0, &self.globe.bind_group, &[]);
-            pass.set_vertex_buffer(0, self.globe.vertex_buf.slice(..));
-            pass.set_index_buffer(self.globe.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.globe.index_count, 0, 0..1);
-            draw_calls += 1;
-            tri_count  += self.globe.index_count / 3;
+            // Depth prepass — always runs regardless of mesh visibility.
+            // Renders the globe as a solid fill with no color writes.  This stamps
+            // the correct globe silhouette into the depth buffer so line layers on
+            // the far side of the globe are occluded everywhere (not just under
+            // the sparse wireframe lines themselves).
+            {
+                let active_mesh = self.globe.mesh(self.lod);
+                pass.set_pipeline(&self.globe.depth_pipeline);
+                pass.set_bind_group(0, &self.globe.bind_group, &[]);
+                pass.set_vertex_buffer(0, active_mesh.vertex_buf.slice(..));
+                pass.set_index_buffer(active_mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..active_mesh.index_count, 0, 0..1);
+            }
+            // Wireframe overlay — skipped when hidden via `geo mesh off`.
+            if self.globe_mesh_visible {
+                let active_mesh = self.globe.mesh(self.lod);
+                pass.set_pipeline(&self.globe.pipeline);
+                pass.set_bind_group(0, &self.globe.bind_group, &[]);
+                pass.set_vertex_buffer(0, active_mesh.vertex_buf.slice(..));
+                pass.set_index_buffer(active_mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..active_mesh.index_count, 0, 0..1);
+                draw_calls += 1;
+                tri_count  += active_mesh.index_count / 3;
+            }
 
             let _ = layers;
             let vp = self.camera.view_proj();
-            // World map renders below OSM lines and aircraft.
+            // World map renders below OSM lines.
             draw_world_map(&self.world_map, &self.world_map_pipeline, &self.queue, &mut pass, vp);
             draw_calls += 3; // fill + border + selected
-            draw_layer(&self.roads,    &self.line_pipeline, &self.queue, &mut pass, vp);
-            draw_layer(&self.railways, &self.line_pipeline, &self.queue, &mut pass, vp);
-            draw_calls += 2;
+            draw_layer(&self.roads,     &self.line_pipeline, &self.queue, &mut pass, vp);
+            draw_layer(&self.railways,  &self.line_pipeline, &self.queue, &mut pass, vp);
+            draw_layer(&self.rivers,    &self.line_pipeline, &self.queue, &mut pass, vp);
+            draw_layer(&self.lakes,     &self.line_pipeline, &self.queue, &mut pass, vp);
+            draw_layer(&self.railroads, &self.line_pipeline, &self.queue, &mut pass, vp);
+            draw_calls += 5;
             for topo in &self.topo_layers {
                 draw_layer(topo, &self.line_pipeline, &self.queue, &mut pass, vp);
                 draw_calls += 1;
             }
-            self.aircraft.render(&self.queue, &mut pass, vp, flights);
-            draw_calls += 1;
-            tri_count  += flights.len() as u32 * 2; // two triangles per aircraft quad
         }
+
+        // ── Project topo-layer features for hover/click ───────────────────────
+        // Use the midpoint of each feature's coordinate list as its screen handle.
+        // Point markers store the true centre in (lat, lon), so project_geo works.
+        // Features with null meta are the silent V-arm of × markers — skip them.
+        hud.geo_features = self.topo_layers.iter().flat_map(|layer| {
+            layer.raw_features.iter().filter_map(|feat| {
+                if feat.meta.is_null() { return None; }
+                // For multi-vertex lines, use the midpoint for a representative position.
+                let (lat, lon) = if feat.coordinates.len() >= 2 {
+                    let mid = feat.coordinates[feat.coordinates.len() / 2];
+                    (mid[0], mid[1])
+                } else {
+                    (feat.lat, feat.lon)
+                };
+                self.project_geo(lat, lon).map(|screen_pos| crate::hud::HudGeoFeature {
+                    screen_pos,
+                    layer_name: layer.name.clone(),
+                    properties: feat.meta.clone(),
+                    lat: feat.lat,
+                    lon: feat.lon,
+                })
+            })
+        }).collect();
+
+        // ── Project aircraft to screen space for egui rendering ───────────────
+        let milsym_cfg = settings.milsym_enabled.then(|| {
+            crate::milsym::classifier::ClassifierConfig::from_settings(
+                &settings.milsym_civil_affiliation,
+                &settings.milsym_military_affiliation,
+                &settings.milsym_unknown_affiliation,
+            )
+        });
+
+        hud.milsym_enabled      = settings.milsym_enabled;
+        // Scale icon size inversely with camera distance so symbols shrink when
+        // zoomed out (cluttered) and grow when zoomed in.  milsym_scale is the
+        // user-controlled multiplier applied on top of the computed base.
+        let zoom_base = (12.0 / self.camera.radius).clamp(3.0, 12.0);
+        hud.milsym_base_size    = zoom_base * settings.milsym_scale;
+        hud.milsym_show_echelon = settings.milsym_show_echelon;
+
+        hud.aircraft = flights
+            .iter()
+            .filter_map(|f| {
+                self.project_geo(f.lat, f.lon).map(|screen_pos| {
+                    let category = f.meta.get("aircraft_category")
+                        .and_then(|v| v.as_str()).unwrap_or("misc");
+                    let milsym = milsym_cfg.as_ref().map(|cfg| {
+                        crate::milsym::classifier::classify_aircraft(category, cfg)
+                    });
+                    crate::hud::HudAircraft {
+                        screen_pos,
+                        icao24: f.meta.get("icao24")
+                            .and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        callsign: f.meta.get("callsign")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from),
+                        aircraft_type: f.meta.get("type")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from),
+                        altitude_ft: f.meta.get("baro_alt_ft")
+                            .and_then(|v| v.as_f64()).map(|v| v as f32),
+                        speed_kts: f.meta.get("velocity_kts")
+                            .and_then(|v| v.as_f64()).map(|v| v as f32),
+                        heading: f.meta.get("heading")
+                            .and_then(|v| v.as_f64()).map(|v| v as f32),
+                        on_ground: f.meta.get("on_ground")
+                            .and_then(|v| v.as_bool()).unwrap_or(false),
+                        category: category.to_string(),
+                        milsym,
+                    }
+                })
+            })
+            .collect();
 
         // ── egui HUD pass ─────────────────────────────────────────────────────
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
@@ -560,8 +813,9 @@ impl WgpuState {
             self.config.height as f32,
         );
 
-        let egui_input  = self.egui_winit.take_egui_input(&self.window);
-        let mut console_out = ConsoleOutput::default();
+        let egui_input = self.egui_winit.take_egui_input(&self.window);
+        let mut console_out  = ConsoleOutput::default();
+        let mut follow_req: Option<String> = None;
         let full_output = self.egui_ctx.run(egui_input, |ctx| {
             // Draw geo labels below HUD/console elements.
             if !geo_labels.is_empty() {
@@ -579,8 +833,8 @@ impl WgpuState {
                     );
                 }
             }
-            hud.draw(ctx);
             console_out = console.draw(ctx, settings);
+            follow_req  = hud.draw(ctx);
         });
         self.egui_winit.handle_platform_output(&self.window, full_output.platform_output);
 
@@ -635,7 +889,7 @@ impl WgpuState {
 
         output.present();
 
-        RenderOutput { console: console_out, gpu_ms, draw_calls, tri_count }
+        RenderOutput { console: console_out, gpu_ms, draw_calls, tri_count, follow_aircraft: follow_req }
     }
 }
 

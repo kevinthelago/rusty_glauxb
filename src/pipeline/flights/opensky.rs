@@ -10,10 +10,14 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::Value;
+use std::time::Duration;
 
 use crate::{
     geo::{GeoBounds, GeoFeature},
-    pipeline::DataSource,
+    pipeline::{
+        rate_limit::{extract_retry_after, RateLimitError},
+        DataSource,
+    },
 };
 
 use super::{AircraftCategory, FlightState};
@@ -61,10 +65,18 @@ impl DataSource for OpenSkySource {
             req = req.basic_auth(u, Some(p));
         }
 
-        let resp: Value = req
+        let response = req
             .send()
             .await
-            .context("OpenSky request failed")?
+            .context("OpenSky request failed")?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // OpenSky uses X-Rate-Limit-Retry-After-Seconds; fall back to 60 s.
+            let delay = extract_retry_after(response.headers(), Duration::from_secs(60));
+            return Err(RateLimitError { retry_after: delay }.into());
+        }
+
+        let resp: Value = response
             .error_for_status()
             .context("OpenSky HTTP error")?
             .json()

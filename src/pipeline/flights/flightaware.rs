@@ -11,10 +11,14 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::Value;
+use std::time::Duration;
 
 use crate::{
     geo::{GeoBounds, GeoFeature},
-    pipeline::DataSource,
+    pipeline::{
+        rate_limit::{extract_retry_after, RateLimitError},
+        DataSource,
+    },
 };
 
 use super::{AircraftCategory, FlightState};
@@ -60,14 +64,21 @@ impl DataSource for FlightAwareSource {
             primary.max_lat, primary.max_lon,
         );
 
-        let resp: Value = self
+        let response = self
             .client
             .get("https://aeroapi.flightaware.com/aeroapi/flights/search")
             .header("x-apikey", key.as_str())
             .query(&[("query", &query), ("max_pages", &"1".to_string())])
             .send()
             .await
-            .context("FlightAware request failed")?
+            .context("FlightAware request failed")?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let delay = extract_retry_after(response.headers(), Duration::from_secs(60));
+            return Err(RateLimitError { retry_after: delay }.into());
+        }
+
+        let resp: Value = response
             .error_for_status()
             .context("FlightAware HTTP error")?
             .json()

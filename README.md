@@ -1,6 +1,32 @@
 # rusty_glauxb
 
-GPU-accelerated HUD globe visualization in Rust. Renders Earth as a cube-sphere with real-time data layers — flight tracking, weather, and more — in a single interactive 3D map.
+**GPU-accelerated 3D globe HUD written in Rust.** Renders Earth as a cube-sphere and overlays real-time and static data — flight tracking, geospatial layers, driving directions, NATO military symbology, and more — in a single interactive 3D map.
+
+Built on [wgpu](https://wgpu.rs) (WebGPU), [egui](https://github.com/emilk/egui), and [tokio](https://tokio.rs).
+
+---
+
+## Features
+
+- **Cube-sphere globe** — uniform texel density, no polar singularities, per-face LOD
+- **Live flight tracking** — ADS-B via ADS-B Exchange, ADS-B.fi, OpenSky, or FlightAware; real-time position updates over WebSocket / HTTP polling
+- **Geospatial layers** — world map polygons (Natural Earth), OpenStreetMap roads/railways, rivers, lakes, tectonic plates, submarine cables, earthquake feeds, and more via a built-in GeoJSON download catalog
+- **Driving directions** — geocoded routes rendered as a 3D line on the globe (OSRM or Google Maps)
+- **NATO military symbology** — MIL-STD-2525D / APP-6A symbol frames with affiliation color-coding; SVG icon support per standard
+- **Location follow** — GPS dot on the globe with camera lock (mock, WebSocket, or native Android)
+- **Voice commands** — push-to-talk → Whisper STT → Claude LLM → layer filter + camera focus
+- **Headless benchmark** — `bench` binary renders frames against real GPU hardware without a window
+- **Unicode text** — multi-script font fallback chain (Hindi/Devanagari, Arabic, CJK, Korean, and more) via system fonts
+
+---
+
+## Requirements
+
+- Rust 1.78+ (stable)
+- A GPU with a WebGPU-capable driver (Vulkan, DX12, Metal, or OpenGL ES)
+- For voice commands: `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` env vars
+
+---
 
 ## Running
 
@@ -8,85 +34,9 @@ GPU-accelerated HUD globe visualization in Rust. Renders Earth as a cube-sphere 
 cargo run --release
 ```
 
-Open the in-app console with the backtick key `` ` ``.
+Open the in-app console with `` ` `` or `~`.
 
-## Console Commands
-
-Commands typed into the in-app console (`` ` `` to toggle). Type `help` for a listing; type `<cmd> help` for detailed usage of any command.
-
-| Command | Description |
-|---------|-------------|
-| `set` | Change a setting and save to disk |
-| `get` | Read the current value of a setting |
-| `list` | Show all settings and their current values |
-| `source` | List datastreams and their current sources, or switch a source |
-| `refresh` | Force-refresh a data layer |
-| `layer` | Toggle layer visibility |
-| `log` | View and control the in-app log stream |
-| `geo` | Control the world-map polygon layer |
-| `topo` | Load and control named GeoJSON topology layers |
-| `camera` | Control camera animation mode |
-| `spectrum` | Toggle the RF spectrum analyzer overlay |
-| `diag` | Print a performance diagnostics table (FPS, GPU/CPU time, RSS, draw calls) |
-| `clip` | Copy any command's output (or filtered log entries) to the clipboard |
-| `location` | Control device location services and the globe position dot |
-| `clear` | Clear console output |
-| `exit` | Close the console |
-| `kill` | Stop pipeline streams (`kill <stream>`) or exit the app (`kill app`) |
-
-Available layer names: `roads`, `railways`, `topo`.
-
-### Location Services
-
-The `location` command controls which GPS source feeds the globe's "you are here" dot.
-
-| Sub-command | Syntax | Description |
-|-------------|--------|-------------|
-| *(bare)* | `location` | Show current source and last fix |
-| `source` | `location source mock\|network\|native\|off` | Switch the active source |
-| `connect` | `location connect ws://ip:port` | Set WebSocket URL and connect |
-| `follow` | `location follow on\|off` | Lock camera to follow device position |
-| `status` | `location status` | Print lat / lon / alt / hdg / spd / acc |
-| `stop` | `location stop` | Stop location services |
-
-Available sources:
-
-| Source | Description |
-|--------|-------------|
-| `mock` | Animated circular path around San Francisco (always available, good for testing) |
-| `network` | WebSocket stream from a companion device; set URL with `location connect` |
-| `native` | Android device GPS via the system location manager (Android only) |
-| `off` | Stop location services and hide the dot |
-
-### Kill / Exit
-
-`kill` is a multi-purpose command:
-
-| Syntax | Description |
-|--------|-------------|
-| `kill` | Stop all pipeline streams (flights, roads, railways) |
-| `kill <stream>` | Stop a single named stream, e.g. `kill flights` |
-| `kill app` | Exit the application |
-
-In-flight fetch tasks finish naturally when a stream is stopped; no new fetches are scheduled for it afterwards.
-
-`exit` closes the console panel without affecting running processes.
-
-### Diagnostics
-
-The `diag` command samples performance stats collected over a rolling 300-frame (~5 s) window and prints a percentile table to the console.
-
-| Sub-command | Syntax | Description |
-|-------------|--------|-------------|
-| *(bare)* | `diag` | Print the rolling stats table (mean / p50 / p95 / p99 / max) |
-| `reset` | `diag reset` | Clear the accumulator and start fresh |
-| `overlay on\|off` | `diag overlay on` | Show a compact fps/gpu/cpu line in the top-left HUD |
-
-Metrics reported: FPS, frame time (ms), GPU time (ms, requires `TIMESTAMP_QUERY` adapter feature), CPU submission time (ms), RSS memory (MB), triangle count, and draw call count.
-
-#### Headless Benchmark (`bench` binary)
-
-Run against real GPU hardware without opening a window:
+### Headless Benchmark
 
 ```bash
 cargo run --release --bin bench -- [--frames N] [--scenario <name>] [--software] [--json]
@@ -94,77 +44,225 @@ cargo run --release --bin bench -- [--frames N] [--scenario <name>] [--software]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--frames N` | `300` | Number of frames to measure (10 warm-up frames excluded) |
-| `--scenario <name>` | `globe-only` | Scene load: `globe-only`, `full-scene` (500 flights), `stress` (5 000 flights) |
-| `--software` | off | Force software (CPU) fallback adapter |
-| `--json` | off | Emit results as JSON instead of ASCII table |
+| `--frames N` | `300` | Frames to measure (10 warm-up excluded) |
+| `--scenario` | `globe-only` | `globe-only`, `full-scene` (500 flights), `stress` (5 000 flights) |
+| `--software` | off | Force software (CPU) adapter |
+| `--json` | off | Emit results as JSON |
 
-### Spectrum Analyzer
+---
 
-The spectrum overlay renders a live RF frequency/power bar chart anchored at the bottom of the screen.
+## Console Commands
+
+Open with `` ` `` or `~`. Type `help` for a listing; `<cmd> help` for detailed usage.
+
+| Command | Description |
+|---------|-------------|
+| `set` | Change a setting and save to disk |
+| `get` | Read the current value of a setting |
+| `list` | Show all settings and their current values |
+| `source` | List datastreams and their current sources, or switch a source (`flights`, `directions`, `location`) |
+| `refresh` | Force-refresh a data layer; busts disk cache for download layers |
+| `layer` | Toggle layer visibility |
+| `log` | View and control the in-app log stream |
+| `geo` | Control the world-map polygon layer |
+| `topo` | Load and control named GeoJSON topology layers |
+| `download` | Browse and fetch GeoJSON datasets from the built-in catalog |
+| `directions` | Get driving directions between two locations and render the route on the globe |
+| `camera` | Control camera animation mode |
+| `diag` | Print a performance diagnostics table (FPS, GPU/CPU time, RSS, draw calls) |
+| `clip` | Copy any command's output (or filtered log entries) to the clipboard |
+| `location` | Control device location services and the globe position dot |
+| `aircraft` | Configure aircraft dot labels and click-to-follow |
+| `milsym` | Toggle NATO military symbology mode and configure affiliations |
+| `symbol` | Assign SVG icons per symbology standard; switch active standard (APP-6A / MIL-STD-2525D) |
+| `clear` | Clear console output |
+| `exit` | Close the console |
+| `kill` | Stop pipeline streams (`kill <stream>`) or exit the app (`kill app`) |
+
+Available layer names: `roads`, `railways`, `rivers`, `lakes`, `railroads`, `topo`.
+
+`rivers`, `lakes`, and `railroads` are loaded automatically from Natural Earth on first run and cached locally for 30 days.
+
+---
+
+### Aircraft Display
+
+Aircraft render as colored dots projected onto the globe. Mouse over for a tooltip; click to follow (when follow is enabled).
 
 | Sub-command | Syntax | Description |
 |-------------|--------|-------------|
-| *(bare)* | `spectrum` | Show usage hint |
-| `on` / `off` | `spectrum on\|off` | Enable or disable the overlay |
-| `source` | `spectrum source` | List available data sources |
-| `source <src>` | `spectrum source dummy` | Switch to a named source |
+| *(bare)* | `aircraft` | Show current label and follow settings |
+| `label` | `aircraft label <field>` | Persistent label: `none` `callsign` `type` `altitude` `speed` `icao24` |
+| `follow` | `aircraft follow on\|off` | Enable/disable click-to-follow |
 
-Available sources: `dummy` (animated 2.4/5 GHz WiFi simulation, always available). Future sources: `wifi` (Android WiFi scan via JNI), `rtlsdr` (RTL-SDR USB dongle).
+Dot colors: green = single-engine, blue = multi-engine/airliner, red = military, amber = misc/balloon, gray = on ground.
 
-### World Map
+---
 
-The world map layer renders Natural Earth GeoJSON polygons on the globe surface. Click any country to drill down to its states/provinces. Click again to select a state. Use `geo back` (or the console command) to navigate back up to the country level.
+### Location Services
+
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| `source location <src>` | `source location mock` | Switch the active source |
+| `location` | `location` | Show current source and last fix |
+| `location connect` | `location connect ws://ip:port` | Set WebSocket URL and connect |
+| `location follow` | `location follow on\|off` | Lock camera to follow device position |
+| `location status` | `location status` | Print lat / lon / alt / hdg / spd / acc |
+| `location stop` | `location stop` | Stop location services |
+
+| Source | Description |
+|--------|-------------|
+| `mock` | Animated circular path around San Francisco (always available) |
+| `network` | WebSocket stream from a companion device |
+| `native` | Android device GPS (Android only) |
+| `off` | Stop location services and hide the dot |
+
+---
+
+### Military Symbology
+
+`milsym` replaces entity dots with MIL-STD-2525D / APP-6A symbol frames. Frame shape and color encode affiliation; the icon inside the frame encodes function.
+
+| Affiliation | Frame | Color |
+|-------------|-------|-------|
+| Friend | Rectangle | Blue |
+| Hostile | Diamond | Red |
+| Neutral | Square | Green |
+| Unknown | Circle | Yellow |
 
 | Sub-command | Syntax | Description |
 |-------------|--------|-------------|
-| `names` | `geo names on\|off` | Country/state name labels projected to screen space |
-| `fill` | `geo fill on\|off` | Polygon fill (semi-transparent) |
-| `borders` | `geo borders on\|off` | Polygon border outlines |
-| `back` | `geo back` | Navigate up one administrative level |
-| `status` | `geo status` | Show feature count, triangle count, and visibility state |
-| *(bare)* | `geo` | Show current names/fill/borders toggle state |
+| `on` / `off` | `milsym on\|off` | Enable or disable symbology mode |
+| `scale` | `milsym scale <f>` | Symbol size multiplier — icon size also scales with zoom |
+| `echelon` | `milsym echelon on\|off` | Show/hide echelon indicator above frame |
+| `affiliation` | `milsym affiliation civil\|military\|unknown <affil>` | Override affiliation for an aircraft category |
 
-Data is fetched from the Natural Earth GitHub mirror on first run and cached locally for 30 days.
+`symbol` manages SVG icon assignments per standard:
 
-### Log System
+| Sub-command | Syntax | Description |
+|-------------|--------|-------------|
+| `assign` | `symbol assign <key> <path>` | Load an SVG file and assign to an icon key |
+| `clear` | `symbol clear <key>` | Revert a key to the built-in hand-drawn icon |
+| `standard` | `symbol standard app6a\|milstd2525d` | Switch the active standard |
+| `list` | `symbol list` | List all keys with loaded/missing status |
 
-The in-app console captures all `DEBUG`+ events regardless of `RUST_LOG`. The terminal only shows `INFO`+ (or whatever `RUST_LOG` specifies). Log lines are formatted as:
+Default affiliation mapping:
+
+| ADS-B category | Default affiliation |
+|----------------|---------------------|
+| `single_engine`, `multi_engine` | `friend` |
+| `military` | `hostile` |
+| `misc`, `balloon`, other | `unknown` |
+
+---
+
+### Directions
 
 ```
-[LEVEL][file:line][span] message
+directions <from> to <to>
+directions <from> | <to>
 ```
 
-Where `[span]` is the enclosing function name when `#[tracing::instrument]` is used, otherwise omitted. Changing `log level` or `log module` only affects what is displayed going forward — it does not retroactively filter lines already in the console output.
+Both endpoints can be GPS coordinates (`lat,lon`) or free-form place names.
 
-### Camera Sub-commands
+| Example | Description |
+|---------|-------------|
+| `directions San Francisco to Los Angeles` | City names |
+| `directions 37.7749,-122.4194 to 34.0522,-118.2437` | GPS coordinates |
+| `directions JFK \| LAX` | Airport codes |
+
+Switch routing source: `source directions osrm` or `source directions google` (requires `google_maps_api_key`).
+
+Remove the route: `topo drop directions`.
+
+---
+
+### GeoJSON Download Catalog
+
+`download` fetches datasets and loads them as named topo layers. Layers are persisted between sessions.
 
 | Sub-command | Syntax | Description |
 |-------------|--------|-------------|
-| `rotate` | `camera rotate [speed] [elasticity]` | Start auto-rotate animation; optional speed (deg/s) and elasticity |
-| `follow aircraft` | `camera follow aircraft <icao24>` | Lock camera onto an aircraft by ICAO24 hex code |
-| `follow location` | `camera follow location` | Lock camera onto the device GPS position |
-| `none` | `camera none` | Free camera — disable animation |
-| `status` | `camera status` | Show current animation mode and parameters |
+| *(bare)* | `download` | List catalog sources and cache status |
+| `<name>` | `download earthquakes` | Fetch a catalog source |
+| `url` | `download url mydata <url>` | Fetch any GeoJSON URL |
+| `clear` | `download clear <name>` | Remove a layer and delete its cache |
+
+Catalog:
+
+| Name | Description | Cache |
+|------|-------------|-------|
+| `graticules` | 10° lat/lon coordinate grid | 1 year |
+| `coastlines` | High-detail coastlines | 1 year |
+| `tectonic` | Tectonic plate boundaries | 1 year |
+| `timezones` | Timezone boundaries | 1 year |
+| `glaciers` | Glaciated areas | 1 year |
+| `reefs` | Coral reefs and atolls | 1 year |
+| `urban` | World urban areas | 1 year |
+| `protected_areas` | National parks and protected lands | 1 year |
+| `airports` | World airports (point data) | 30 days |
+| `ports` | World seaports (point data) | 30 days |
+| `populated_places` | World cities and towns (point data) | 30 days |
+| `submarine_cables` | Undersea internet cable routes | 30 days |
+| `earthquakes` | USGS significant earthquakes — past 30 days | 1 hour |
+| `earthquakes_all` | USGS M2.5+ earthquakes — past 7 days | 1 hour |
+| `volcanoes` | Active volcanoes worldwide | 7 days |
+
+---
+
+### Camera
+
+| Sub-command | Syntax | Description |
+|-------------|--------|-------------|
+| `rotate` | `camera rotate [speed] [elasticity]` | Auto-rotate animation |
+| `follow aircraft` | `camera follow aircraft <icao24>` | Lock onto an aircraft |
+| `follow location` | `camera follow location` | Lock onto device GPS |
+| `follow smoothing` | `camera follow smoothing <0–1>` | Follow lag (0 = instant, 1 = very slow) |
+| `follow distance` | `camera follow distance <r>` | Camera radius in globe radii |
+| `overlay on\|off` | `camera overlay on\|off` | Toggle the follow-mode HUD info panel |
+| `none` | `camera none` | Free camera |
+| `status` | `camera status` | Show current mode and parameters |
+
+---
+
+### Diagnostics
+
+| Sub-command | Syntax | Description |
+|-------------|--------|-------------|
+| *(bare)* | `diag` | Rolling stats table (mean / p50 / p95 / p99 / max) |
+| `reset` | `diag reset` | Clear the accumulator |
+| `overlay on\|off` | `diag overlay on` | Compact fps/gpu/cpu line in the HUD corner |
+
+Metrics: FPS, frame time (ms), GPU time (ms), CPU submission time (ms), RSS memory (MB), triangle count, draw calls.
+
+---
 
 ### Settings Keys
 
 | Key | Description |
 |-----|-------------|
-| `flight_source` | Data source: `adsbfi`, `opensky`, `adsbexchange`, `flightaware` |
+| `flight_source` | `adsbfi`, `opensky`, `adsbexchange`, `flightaware` |
 | `refresh_secs` | Fetch interval in seconds |
-| `camera_mode` | `none`, `rotate`, or `follow` |
+| `camera_mode` | `none`, `rotate`, `follow`, or `follow_location` |
 | `rotate_speed` | Rotation speed in degrees/second |
-| `rotate_elasticity` | Rotation smoothing (0 = instant, 1 = very smooth) |
-| `follow_entity` | ICAO24 hex code of the aircraft to follow |
-| `follow_smoothing` | Follow smoothing factor |
-| `follow_distance` | Camera distance when following |
+| `rotate_elasticity` | Rotation smoothing (0–1) |
+| `follow_entity` | ICAO24 of aircraft to follow |
+| `follow_smoothing` | Follow lag (0–1, default 0.15) |
+| `follow_distance` | Camera radius while following (globe radii) |
+| `idle_resume_secs` | Seconds idle before rotate resumes after a drag (`0` = disabled) |
+| `directions_source` | `osrm` or `google` |
+| `google_maps_api_key` | API key for Google Maps Directions |
+| `milsym_scale` | Military symbol size multiplier |
+
+---
 
 ## Keyboard Shortcuts
 
 | Key | Action |
 |-----|--------|
-| `` ` `` | Toggle console |
+| `` ` `` or `~` | Toggle console |
 | `Space` (hold) | Push-to-talk voice command |
 | Left-drag | Orbit globe |
 | Scroll | Zoom |
+| Click aircraft dot | Follow (when `aircraft follow on`) |
+| Click country | Drill down to states/provinces |

@@ -21,9 +21,6 @@ pub struct LocationManager {
     pub rx:          watch::Receiver<Option<LocationFrame>>,
     task:            Option<JoinHandle<()>>,
     pub source_name: String,
-    /// When true, `app.rs` passes the current fix to `CameraAnimator` so the
-    /// globe follows the device position.
-    pub follow:      bool,
     /// WebSocket URL used by the network source.
     pub network_url: String,
 }
@@ -42,7 +39,6 @@ impl LocationManager {
             rx,
             task:        None,
             source_name: "off".to_string(),
-            follow:      false,
             network_url: "ws://192.168.1.100:7777".to_string(),
         }
     }
