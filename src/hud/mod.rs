@@ -236,6 +236,11 @@ pub struct Hud {
     pub symbol_map:          crate::milsym::symbol_map::SymbolMap,
     /// Projected topo-layer features for hover/click, rebuilt each frame.
     pub geo_features: Vec<HudGeoFeature>,
+    /// Per-pipeline fetch health for the health panel (PIPE-6).  Set each frame
+    /// by `app.rs` from `PipelineManager::health()`; empty hides the panel.
+    pub pipeline_health: Vec<crate::pipeline::PipelineHealth>,
+    /// Whether to draw the pipeline-health panel when pipelines exist.
+    pub show_pipeline_health: bool,
     /// Feature currently pinned open in the info panel (click to select, click again / close to dismiss).
     selected_geo: Option<HudGeoFeature>,
     // ── AI summary ────────────────────────────────────────────────────────────
@@ -264,6 +269,8 @@ impl Hud {
             milsym_show_echelon: true,
             symbol_map:          crate::milsym::symbol_map::SymbolMap::default(),
             geo_features:        Vec::new(),
+            pipeline_health:        Vec::new(),
+            show_pipeline_health:   true,
             selected_geo:        None,
             rt,
             summary:         None,
@@ -304,6 +311,63 @@ impl Hud {
         }
         // Keep repainting while loading so the spinner animates.
         if self.summary_loading { ctx.request_repaint(); }
+
+        // ── Pipeline health panel (PIPE-6) ─────────────────────────────────
+        // Display-only: renders the snapshot app.rs sets from
+        // PipelineManager::health(). Independent of ENG-4 (no input handling);
+        // uses the ENG-7 touch-sizing helpers.
+        if self.show_pipeline_health && !self.pipeline_health.is_empty() {
+            let m = touch_metrics(ctx);
+            let panel_w = if m.touch {
+                (m.screen_width * 0.6).clamp(220.0, 360.0)
+            } else {
+                240.0
+            };
+            egui::Window::new("Pipelines")
+                .id(egui::Id::new("pipeline_health_panel"))
+                .anchor(egui::Align2::LEFT_TOP, [8.0, 40.0])
+                .resizable(false)
+                .collapsible(true)
+                .default_width(panel_w)
+                .show(ctx, |ui| {
+                    apply_touch_spacing(ui, &m);
+                    for h in &self.pipeline_health {
+                        let (color, state) = match h.status {
+                            crate::pipeline::PipelineStatus::Ok => {
+                                (egui::Color32::from_rgb(64, 210, 64), format!("{} features", h.feature_count))
+                            }
+                            crate::pipeline::PipelineStatus::Pending => {
+                                (egui::Color32::from_rgb(255, 200, 60), "fetching…".to_string())
+                            }
+                            crate::pipeline::PipelineStatus::Error => {
+                                (egui::Color32::from_rgb(255, 80, 60), "error".to_string())
+                            }
+                        };
+                        ui.horizontal(|ui| {
+                            // Color-coded status square (widely-supported glyph).
+                            ui.colored_label(color, "■");
+                            ui.label(egui::RichText::new(&h.layer).size(m.text_size).strong());
+                            ui.label(egui::RichText::new(state).size(m.text_size - 1.0).weak());
+                        });
+                        if h.status == crate::pipeline::PipelineStatus::Error {
+                            if let Some(err) = &h.last_error {
+                                ui.label(
+                                    egui::RichText::new(err)
+                                        .size(m.text_size - 2.0)
+                                        .color(egui::Color32::from_rgb(255, 120, 100)),
+                                );
+                            }
+                        }
+                        if let Some(age) = h.last_update.map(|t| t.elapsed().as_secs()) {
+                            ui.label(
+                                egui::RichText::new(format!("updated {age}s ago"))
+                                    .size(m.text_size - 2.0)
+                                    .weak(),
+                            );
+                        }
+                    }
+                });
+        }
 
         // ── Top-right: voice status toast ──────────────────────────────────
         if let Some(status) = &self.voice_status {
