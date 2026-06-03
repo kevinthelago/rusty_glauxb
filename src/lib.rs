@@ -17,6 +17,7 @@ pub mod layers;
 pub mod log_capture;
 pub mod natural_earth;
 pub mod pipeline;
+pub mod platform_paths;
 pub mod renderer;
 pub mod settings;
 pub mod topo;

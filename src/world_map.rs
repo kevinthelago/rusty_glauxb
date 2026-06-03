@@ -104,15 +104,7 @@ async fn load_states_for(country_iso: &str) -> anyhow::Result<Vec<GeoPolygon>> {
 // ─── Cache helpers ────────────────────────────────────────────────────────────
 
 fn cache_path(filename: &str) -> anyhow::Result<PathBuf> {
-    // On Android, dirs::data_local_dir() returns None; fall back to the
-    // process working directory which NativeActivity sets to internal storage.
-    let base = dirs::data_local_dir()
-        .or_else(|| std::env::current_dir().ok())
-        .context("cannot locate local data directory")?;
-    let dir = base.join("rusty_glauxb").join("cache");
-    std::fs::create_dir_all(&dir)
-        .context("failed to create cache directory")?;
-    Ok(dir.join(filename))
+    crate::platform_paths::cache_file("", filename)
 }
 
 async fn fetch_cached(url: &str, path: &PathBuf) -> anyhow::Result<String> {

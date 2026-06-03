@@ -67,12 +67,7 @@ async fn fetch_lines(url: &str, cache_file: &str) -> anyhow::Result<Vec<GeoFeatu
 }
 
 fn cache_path(filename: &str) -> anyhow::Result<PathBuf> {
-    let base = dirs::data_local_dir()
-        .or_else(|| std::env::current_dir().ok())
-        .context("cannot locate local data directory")?;
-    let dir = base.join("rusty_glauxb").join("cache");
-    std::fs::create_dir_all(&dir).context("failed to create cache directory")?;
-    Ok(dir.join(filename))
+    crate::platform_paths::cache_file("", filename)
 }
 
 async fn fetch_cached(url: &str, path: &PathBuf) -> anyhow::Result<String> {

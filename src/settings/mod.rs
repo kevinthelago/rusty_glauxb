@@ -136,7 +136,7 @@ impl Default for Settings {
 
 impl Settings {
     fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("rusty_glauxb").join("settings.toml"))
+        crate::platform_paths::config_file("settings.toml").ok()
     }
 
     pub fn load() -> Self {
@@ -147,9 +147,6 @@ impl Settings {
 
     pub fn save(&self) {
         let Some(path) = Self::config_path() else { return };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
         if let Ok(text) = toml::to_string_pretty(self) {
             let _ = std::fs::write(&path, text);
         }

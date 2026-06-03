@@ -222,16 +222,7 @@ pub fn clear_cache(name: &str) {
 }
 
 fn cache_path(name: &str) -> anyhow::Result<PathBuf> {
-    let dir = data_dir()?.join("cache").join("downloads");
-    std::fs::create_dir_all(&dir).context("creating downloads cache directory")?;
-    Ok(dir.join(format!("{name}.geojson")))
-}
-
-fn data_dir() -> anyhow::Result<PathBuf> {
-    let base = dirs::data_local_dir()
-        .or_else(|| std::env::current_dir().ok())
-        .context("cannot locate local data directory")?;
-    Ok(base.join("rusty_glauxb"))
+    crate::platform_paths::cache_file("downloads", &format!("{name}.geojson"))
 }
 
 // ─── Session persistence ──────────────────────────────────────────────────────
@@ -264,7 +255,5 @@ pub fn load_state() -> Vec<SavedLayer> {
 }
 
 fn state_path() -> anyhow::Result<PathBuf> {
-    let dir = data_dir()?;
-    std::fs::create_dir_all(&dir).context("creating data directory")?;
-    Ok(dir.join("active_downloads.json"))
+    crate::platform_paths::data_file("active_downloads.json")
 }
