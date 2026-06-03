@@ -19,10 +19,7 @@
 //! data survives restarts and remains available offline.  When the network is
 //! unreachable the fetch falls back to the last cached copy regardless of age.
 
-use std::{
-    path::Path,
-    time::{Duration, SystemTime},
-};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -88,7 +85,7 @@ impl DataSource for RemoteGeoJsonSource {
         let path = self.cache_path()?;
 
         // 1. Serve a fresh cache without touching the network.
-        if let Some(text) = read_fresh_cache(&path, self.cache_ttl()) {
+        if let Some(text) = crate::platform_paths::read_if_fresh(&path, self.cache_ttl()) {
             tracing::debug!(pipeline = %self.config.id, "remote: cache hit");
             return crate::topo::parse_geojson_text(&text);
         }
@@ -102,11 +99,16 @@ impl DataSource for RemoteGeoJsonSource {
                 }
                 let resp = resp.error_for_status().context("HTTP error")?;
                 let text = resp.text().await.context("reading response body")?;
-                write_cache(&path, &text);
-                crate::topo::parse_geojson_text(&text)
+                // Parse before caching so a corrupt download never poisons the
+                // cache; only valid GeoJSON is persisted (atomically).
+                let features = crate::topo::parse_geojson_text(&text)?;
+                if let Err(e) = crate::platform_paths::write_atomic(&path, text.as_bytes()) {
+                    tracing::warn!(pipeline = %self.config.id, error = %e, "remote: cache write failed");
+                }
+                Ok(features)
             }
             // 3. Offline / transport failure: fall back to a stale cache if any.
-            Err(net_err) => match read_any_cache(&path) {
+            Err(net_err) => match crate::platform_paths::read_stale(&path) {
                 Some(text) => {
                     tracing::warn!(
                         pipeline = %self.config.id,
@@ -123,37 +125,6 @@ impl DataSource for RemoteGeoJsonSource {
     }
 }
 
-// ─── Cache helpers (sync, testable) ─────────────────────────────────────────────
-
-/// Read the cache file at `path` if it exists and is younger than `ttl`.
-fn read_fresh_cache(path: &Path, ttl: Duration) -> Option<String> {
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    let age = SystemTime::now().duration_since(modified).unwrap_or(ttl);
-    if age < ttl {
-        std::fs::read_to_string(path).ok()
-    } else {
-        None
-    }
-}
-
-/// Read the cache file regardless of age; used as the offline fallback.
-/// Treats an empty file as absent so a truncated write never yields `[]`.
-fn read_any_cache(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    if text.trim().is_empty() {
-        None
-    } else {
-        Some(text)
-    }
-}
-
-/// Best-effort cache write; logs but does not fail on I/O error.
-fn write_cache(path: &Path, text: &str) {
-    if let Err(e) = std::fs::write(path, text) {
-        tracing::warn!(path = %path.display(), error = %e, "remote: cache write failed");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,12 +132,6 @@ mod tests {
 
     fn cfg(id: &str) -> PipelineConfig {
         PipelineConfig::new(id, "Test", "https://example.com/a.geojson", Cadence::Static).unwrap()
-    }
-
-    fn unique_tmp(name: &str) -> std::path::PathBuf {
-        // Process id keeps parallel test runs from colliding without needing a
-        // random source (unavailable here).
-        std::env::temp_dir().join(format!("glauxb_test_{}_{}", std::process::id(), name))
     }
 
     #[test]
@@ -192,38 +157,5 @@ mod tests {
         let src = RemoteGeoJsonSource::new(c);
         assert_eq!(src.max_staleness_secs(), 12.0);
         assert_eq!(src.cache_ttl(), Duration::from_secs(12));
-    }
-
-    #[test]
-    fn fresh_cache_is_read_stale_is_not() {
-        let path = unique_tmp("fresh.geojson");
-        std::fs::write(&path, "hello").unwrap();
-        // Just written → fresh under a 1h ttl.
-        assert_eq!(
-            read_fresh_cache(&path, Duration::from_secs(3600)).as_deref(),
-            Some("hello")
-        );
-        // Zero ttl → always stale.
-        assert!(read_fresh_cache(&path, Duration::from_secs(0)).is_none());
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn any_cache_falls_back_but_skips_empty() {
-        let path = unique_tmp("any.geojson");
-        assert!(read_any_cache(&path).is_none()); // missing
-        std::fs::write(&path, "   \n").unwrap();
-        assert!(read_any_cache(&path).is_none()); // empty/whitespace
-        std::fs::write(&path, "{\"type\":\"FeatureCollection\"}").unwrap();
-        assert!(read_any_cache(&path).is_some());
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn write_cache_round_trips() {
-        let path = unique_tmp("write.geojson");
-        write_cache(&path, "payload");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "payload");
-        let _ = std::fs::remove_file(&path);
     }
 }

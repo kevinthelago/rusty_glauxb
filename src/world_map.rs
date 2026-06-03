@@ -7,8 +7,8 @@
 //!   states:     ne_50m_admin_1_states_provinces.geojson  (~3 MB)
 
 use std::{
-    path::PathBuf,
-    time::{Duration, SystemTime},
+    path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::Context as _;
@@ -107,34 +107,38 @@ fn cache_path(filename: &str) -> anyhow::Result<PathBuf> {
     crate::platform_paths::cache_file("", filename)
 }
 
-async fn fetch_cached(url: &str, path: &PathBuf) -> anyhow::Result<String> {
+async fn fetch_cached(url: &str, path: &Path) -> anyhow::Result<String> {
     // Use disk cache if fresh enough.
-    if let Ok(meta) = std::fs::metadata(path) {
-        if let Ok(modified) = meta.modified() {
-            if SystemTime::now().duration_since(modified).unwrap_or(CACHE_TTL) < CACHE_TTL {
-                tracing::debug!(path = %path.display(), "loading from cache");
-                return std::fs::read_to_string(path)
-                    .context("reading cached file");
-            }
-        }
+    if let Some(text) = crate::platform_paths::read_if_fresh(path, CACHE_TTL) {
+        tracing::debug!(path = %path.display(), "loading from cache");
+        return Ok(text);
     }
 
     tracing::warn!(url, "downloading Natural Earth data…");
-    let text = reqwest::get(url)
-        .await
-        .context("GET request failed")?
-        .error_for_status()
-        .context("HTTP error")?
-        .text()
-        .await
-        .context("reading response body")?;
-
-    // Save to cache (best-effort; don't fail if write fails).
-    if let Err(e) = std::fs::write(path, &text) {
-        tracing::warn!("could not cache {}: {e}", path.display());
+    match reqwest::get(url).await {
+        Ok(resp) => {
+            let text = resp
+                .error_for_status()
+                .context("HTTP error")?
+                .text()
+                .await
+                .context("reading response body")?;
+            // Save to cache atomically (best-effort; don't fail if write fails).
+            if let Err(e) = crate::platform_paths::write_atomic(path, text.as_bytes()) {
+                tracing::warn!("could not cache {}: {e}", path.display());
+            }
+            Ok(text)
+        }
+        // Offline: serve the last cached copy regardless of age.
+        Err(net_err) => match crate::platform_paths::read_stale(path) {
+            Some(text) => {
+                tracing::warn!(url, "world map: network unreachable, serving stale cache");
+                Ok(text)
+            }
+            None => Err(anyhow::Error::new(net_err)
+                .context("GET request failed (no cached world-map data)")),
+        },
     }
-
-    Ok(text)
 }
 
 // ─── GeoJSON parsers ──────────────────────────────────────────────────────────

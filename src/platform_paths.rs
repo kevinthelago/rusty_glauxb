@@ -14,7 +14,8 @@
 //! this module so the platform-specific fallback logic lives in exactly one
 //! place.  All paths are namespaced under an [`APP_DIR`] subfolder.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context as _;
 
@@ -91,6 +92,63 @@ pub fn cache_file(subdir: &str, name: &str) -> anyhow::Result<PathBuf> {
     Ok(ensure_dir(dir)?.join(name))
 }
 
+// ─── Cache I/O hardening ────────────────────────────────────────────────────────
+//
+// Every on-disk cache (the download catalog, Natural Earth data, and user
+// pipelines) writes through [`write_atomic`] and reads through
+// [`read_if_fresh`] / [`read_stale`].  Centralising the I/O here gives all of
+// them the same offline-resilient behaviour: a crash mid-write can never leave a
+// truncated file, an empty/partial file is treated as absent, and a stale copy
+// is still available when the network is down.
+
+/// Atomically replace `path` with `contents`.
+///
+/// Writes a sibling temp file (named `<file>.<pid>.tmp`, so it lands on the same
+/// filesystem and never collides across processes) then renames it over `path`.
+/// `std::fs::rename` is atomic and replaces the destination on every supported
+/// platform, so a reader sees either the old file or the complete new one —
+/// never a half-written cache.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "cache".to_string());
+    let tmp = path.with_file_name(format!("{file_name}.{}.tmp", std::process::id()));
+    // Best-effort cleanup of the temp file if the rename fails.
+    let result = std::fs::write(&tmp, contents).and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Read `path` as text if it exists and is younger than `max_age`.
+///
+/// Returns `None` when the file is missing, older than `max_age`, or empty
+/// (an empty file is treated as a corrupt/partial cache, not a valid result).
+pub fn read_if_fresh(path: &Path, max_age: Duration) -> Option<String> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    // A clock that jumped backwards yields Err → treat as stale.
+    let age = SystemTime::now().duration_since(modified).ok()?;
+    if age < max_age {
+        read_stale(path)
+    } else {
+        None
+    }
+}
+
+/// Read `path` as text regardless of age, for use as an offline fallback.
+/// Returns `None` if the file is missing or blank so a truncated write never
+/// surfaces as valid (empty) content.
+pub fn read_stale(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +192,49 @@ mod tests {
         assert!(cfg.parent().unwrap().is_dir());
         let data = data_file("unit_test_state.json").expect("data file path");
         assert!(data.parent().unwrap().is_dir());
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("glauxb_pp_{}_{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn write_atomic_replaces_and_leaves_no_temp() {
+        let path = tmp("atomic.txt");
+        write_atomic(&path, b"first").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        // Overwrite is atomic and leaves the destination complete.
+        write_atomic(&path, b"second").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        // No leftover temp sibling.
+        let leftover = path.with_file_name(format!("atomic.txt.{}.tmp", std::process::id()));
+        assert!(!leftover.exists());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_if_fresh_respects_age_and_emptiness() {
+        let path = tmp("fresh.txt");
+        write_atomic(&path, b"data").unwrap();
+        assert_eq!(
+            read_if_fresh(&path, Duration::from_secs(3600)).as_deref(),
+            Some("data")
+        );
+        assert!(read_if_fresh(&path, Duration::from_secs(0)).is_none());
+        // Empty file → treated as absent even when fresh.
+        write_atomic(&path, b"   ").unwrap();
+        assert!(read_if_fresh(&path, Duration::from_secs(3600)).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_stale_falls_back_but_skips_missing_and_empty() {
+        let path = tmp("stale.txt");
+        assert!(read_stale(&path).is_none()); // missing
+        write_atomic(&path, b"\n\t ").unwrap();
+        assert!(read_stale(&path).is_none()); // blank
+        write_atomic(&path, b"payload").unwrap();
+        assert_eq!(read_stale(&path).as_deref(), Some("payload"));
+        let _ = std::fs::remove_file(&path);
     }
 }

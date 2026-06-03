@@ -1,7 +1,4 @@
-use std::{
-    path::PathBuf,
-    time::{Duration, SystemTime},
-};
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::Context as _;
 
@@ -160,6 +157,11 @@ pub fn find(name: &str) -> Option<&'static CatalogEntry> {
 }
 
 /// Fetch a GeoJSON dataset, using a disk cache when `cache_secs > 0`.
+///
+/// Hardened for offline use: a fresh-but-corrupt cache is ignored and refetched,
+/// only valid GeoJSON is cached (atomically, so a crash mid-write can't truncate
+/// it), and when the network is unreachable the last cached copy is served
+/// regardless of age.
 pub async fn fetch(
     name:       &str,
     url:        &str,
@@ -167,44 +169,59 @@ pub async fn fetch(
 ) -> anyhow::Result<Vec<GeoFeature>> {
     let path = cache_path(name)?;
 
+    // 1. Fresh, parseable cache → use it.  A corrupt cache is logged and
+    //    refetched rather than surfaced as an error.
     if cache_secs > 0 {
-        let ttl = Duration::from_secs(cache_secs);
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if let Ok(modified) = meta.modified() {
-                let age = SystemTime::now().duration_since(modified).unwrap_or(ttl);
-                if age < ttl {
+        if let Some(text) =
+            crate::platform_paths::read_if_fresh(&path, Duration::from_secs(cache_secs))
+        {
+            match crate::topo::parse_geojson_text(&text) {
+                Ok(features) => {
                     tracing::info!(name, "download: reading from cache");
-                    let text = std::fs::read_to_string(&path)
-                        .context("reading cached GeoJSON")?;
-                    return crate::topo::parse_geojson_text(&text);
+                    return Ok(features);
+                }
+                Err(e) => {
+                    tracing::warn!(name, error = %e, "download: cached file corrupt, refetching");
                 }
             }
         }
     }
 
+    // 2. Network fetch.
     tracing::info!(name, url, "download: fetching…");
-    let resp = reqwest::get(url)
-        .await
-        .context("HTTP GET failed")?;
+    match reqwest::get(url).await {
+        Ok(resp) => {
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                anyhow::bail!("rate limited (429) fetching {url}");
+            }
+            let text = resp
+                .error_for_status()
+                .context("HTTP error")?
+                .text()
+                .await
+                .context("reading response body")?;
 
-    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        anyhow::bail!("rate limited (429) fetching {url}");
-    }
-
-    let text = resp
-        .error_for_status()
-        .context("HTTP error")?
-        .text()
-        .await
-        .context("reading response body")?;
-
-    if cache_secs > 0 {
-        if let Err(e) = std::fs::write(&path, &text) {
-            tracing::warn!("could not cache download '{name}': {e}");
+            // Parse before caching so garbage is never persisted.
+            let features = crate::topo::parse_geojson_text(&text)?;
+            if cache_secs > 0 {
+                if let Err(e) = crate::platform_paths::write_atomic(&path, text.as_bytes()) {
+                    tracing::warn!("could not cache download '{name}': {e}");
+                }
+            }
+            Ok(features)
+        }
+        // 3. Transport failure (offline) → serve a stale cache if usable.
+        Err(net_err) => {
+            if let Some(text) = crate::platform_paths::read_stale(&path) {
+                if let Ok(features) = crate::topo::parse_geojson_text(&text) {
+                    tracing::warn!(name, "download: network unreachable, serving stale cache");
+                    return Ok(features);
+                }
+            }
+            Err(anyhow::Error::new(net_err)
+                .context(format!("HTTP GET failed for '{name}' (no usable cache)")))
         }
     }
-
-    crate::topo::parse_geojson_text(&text)
 }
 
 /// Return `true` if a non-empty cache file exists for `name`.
