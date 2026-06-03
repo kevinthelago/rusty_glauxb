@@ -205,6 +205,51 @@ fn make_scheduler(source: &dyn DataSource) -> QueryScheduler {
     ).with_cooldown(cooldown_secs)
 }
 
+// ─── Pipeline health (PIPE-6) ───────────────────────────────────────────────
+
+/// Outcome of a pipeline's most recent fetch, for the pipeline-health HUD.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipelineStatus {
+    /// A fetch is in flight and has not reported back yet.
+    Pending,
+    /// The most recent fetch succeeded.
+    Ok,
+    /// The most recent fetch failed (network/parse error or rate-limit).
+    Error,
+}
+
+/// Point-in-time view of one pipeline's fetch health.
+#[derive(Clone, Debug)]
+pub struct PipelineHealth {
+    pub layer: String,
+    pub status: PipelineStatus,
+    /// Feature count from the most recent successful fetch.
+    pub feature_count: usize,
+    /// Message from the most recent failed fetch, if any.
+    pub last_error: Option<String>,
+    /// When the status last changed; `None` until the first fetch is dispatched.
+    pub last_update: Option<Instant>,
+}
+
+impl PipelineHealth {
+    fn new(layer: String) -> Self {
+        Self {
+            layer,
+            status: PipelineStatus::Pending,
+            feature_count: 0,
+            last_error: None,
+            last_update: None,
+        }
+    }
+}
+
+/// Fetch-outcome report sent from a spawned fetch task back to the manager so
+/// it can update pipeline health on the next [`PipelineManager::tick`].
+enum HealthReport {
+    Ok { layer: String, count: usize },
+    Err { layer: String, error: String },
+}
+
 // ─── PipelineManager ─────────────────────────────────────────────────────────
 
 /// Holds all registered data sources and drives the fetch-dispatch loop.
@@ -218,11 +263,17 @@ pub struct PipelineManager {
     /// Rate-limit backoff signals sent from spawned fetch tasks.
     backoff_tx: mpsc::UnboundedSender<(String, Duration)>,
     backoff_rx: mpsc::UnboundedReceiver<(String, Duration)>,
+    /// Per-layer fetch health (PIPE-6), keyed by `layer_name()`.
+    health: HashMap<String, PipelineHealth>,
+    /// Fetch-outcome reports sent from spawned fetch tasks.
+    health_tx: mpsc::UnboundedSender<HealthReport>,
+    health_rx: mpsc::UnboundedReceiver<HealthReport>,
 }
 
 impl PipelineManager {
     pub fn new(rt: Handle) -> Self {
         let (backoff_tx, backoff_rx) = mpsc::unbounded_channel();
+        let (health_tx, health_rx) = mpsc::unbounded_channel();
         Self {
             rt,
             sources:    Vec::new(),
@@ -230,6 +281,9 @@ impl PipelineManager {
             receivers:  HashMap::new(),
             backoff_tx,
             backoff_rx,
+            health:     HashMap::new(),
+            health_tx,
+            health_rx,
         }
     }
 
@@ -260,6 +314,11 @@ impl PipelineManager {
     /// spawns a `tokio` task that calls `DataSource::fetch` and pushes the
     /// result through the watch channel.
     pub fn tick(&mut self, bounds: &GeoBounds) {
+        // Apply fetch-outcome reports from in-flight tasks to pipeline health.
+        while let Ok(report) = self.health_rx.try_recv() {
+            self.apply_health_report(report);
+        }
+
         // Apply any rate-limit backoffs signalled by in-flight tasks.
         while let Ok((layer, delay)) = self.backoff_rx.try_recv() {
             for (source, scheduler) in &mut self.sources {
@@ -282,15 +341,28 @@ impl PipelineManager {
             let source     = Arc::clone(source);
             let bounds     = bounds.clone();
             let backoff_tx = self.backoff_tx.clone();
+            let health_tx  = self.health_tx.clone();
+            let layer      = source.layer_name().to_string();
             let Some(tx) = self.senders.get(source.layer_name()).cloned() else {
                 continue;
             };
 
+            // Mark the layer as fetching so the health HUD shows in-flight state.
+            self.health
+                .entry(layer.clone())
+                .or_insert_with(|| PipelineHealth::new(layer.clone()))
+                .status = PipelineStatus::Pending;
+            if let Some(h) = self.health.get_mut(&layer) {
+                h.last_update = Some(Instant::now());
+            }
+
             self.rt.spawn(async move {
                 match source.fetch(&bounds).await {
                     Ok(features) => {
+                        let count = features.len();
                         // Ignore send errors — receiver may have been dropped
                         let _ = tx.send(features);
+                        let _ = health_tx.send(HealthReport::Ok { layer, count });
                     }
                     Err(e) => {
                         if let Some(rl) = e.downcast_ref::<RateLimitError>() {
@@ -299,17 +371,59 @@ impl PipelineManager {
                                 retry_after_s = rl.retry_after.as_secs(),
                                 "rate limited (429)"
                             );
-                            let _ = backoff_tx.send((
-                                source.layer_name().to_string(),
-                                rl.retry_after,
-                            ));
+                            let _ = backoff_tx.send((layer.clone(), rl.retry_after));
+                            let _ = health_tx.send(HealthReport::Err {
+                                layer,
+                                error: format!(
+                                    "rate limited — retry in {}s",
+                                    rl.retry_after.as_secs()
+                                ),
+                            });
                         } else {
                             tracing::error!(source = source.name(), "fetch error: {e:#}");
+                            let _ = health_tx.send(HealthReport::Err {
+                                layer,
+                                error: format!("{e:#}"),
+                            });
                         }
                     }
                 }
             });
         }
+    }
+
+    /// Apply a single fetch-outcome report to the per-layer health map.
+    fn apply_health_report(&mut self, report: HealthReport) {
+        let now = Instant::now();
+        match report {
+            HealthReport::Ok { layer, count } => {
+                let h = self
+                    .health
+                    .entry(layer.clone())
+                    .or_insert_with(|| PipelineHealth::new(layer));
+                h.status = PipelineStatus::Ok;
+                h.feature_count = count;
+                h.last_error = None;
+                h.last_update = Some(now);
+            }
+            HealthReport::Err { layer, error } => {
+                let h = self
+                    .health
+                    .entry(layer.clone())
+                    .or_insert_with(|| PipelineHealth::new(layer));
+                h.status = PipelineStatus::Error;
+                h.last_error = Some(error);
+                h.last_update = Some(now);
+            }
+        }
+    }
+
+    /// Snapshot of every tracked pipeline's health, sorted by layer name for a
+    /// stable display order.  Consumed by the pipeline-health HUD (PIPE-6).
+    pub fn health(&self) -> Vec<PipelineHealth> {
+        let mut out: Vec<PipelineHealth> = self.health.values().cloned().collect();
+        out.sort_by(|a, b| a.layer.cmp(&b.layer));
+        out
     }
 
     /// Names of all registered layers (for the HUD layer list and voice prompt).
@@ -357,12 +471,14 @@ impl PipelineManager {
                 if let Some(tx) = self.senders.get(name) {
                     let _ = tx.send(Vec::new());
                 }
+                self.health.remove(name);
             }
             None => {
                 self.sources.clear();
                 for tx in self.senders.values() {
                     let _ = tx.send(Vec::new());
                 }
+                self.health.clear();
             }
         }
     }
@@ -408,5 +524,99 @@ impl DataSource for StaticGeoJsonSource {
             .filter(|f| bounds.contains(f.lat, f.lon))
             .cloned()
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    fn manager() -> PipelineManager {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        PipelineManager::new(rt.handle().clone())
+    }
+
+    #[test]
+    fn ok_report_sets_status_and_count() {
+        let mut m = manager();
+        m.apply_health_report(HealthReport::Ok {
+            layer: "roads".into(),
+            count: 42,
+        });
+        let h = m.health();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].layer, "roads");
+        assert_eq!(h[0].status, PipelineStatus::Ok);
+        assert_eq!(h[0].feature_count, 42);
+        assert!(h[0].last_error.is_none());
+        assert!(h[0].last_update.is_some());
+    }
+
+    #[test]
+    fn err_report_sets_error_and_preserves_prior_count() {
+        let mut m = manager();
+        m.apply_health_report(HealthReport::Ok {
+            layer: "quakes".into(),
+            count: 10,
+        });
+        m.apply_health_report(HealthReport::Err {
+            layer: "quakes".into(),
+            error: "boom".into(),
+        });
+        let h = m.health();
+        assert_eq!(h[0].status, PipelineStatus::Error);
+        assert_eq!(h[0].last_error.as_deref(), Some("boom"));
+        // A failed refetch keeps the last good count for display.
+        assert_eq!(h[0].feature_count, 10);
+    }
+
+    #[test]
+    fn recovery_clears_error() {
+        let mut m = manager();
+        m.apply_health_report(HealthReport::Err {
+            layer: "x".into(),
+            error: "down".into(),
+        });
+        m.apply_health_report(HealthReport::Ok {
+            layer: "x".into(),
+            count: 3,
+        });
+        let h = m.health();
+        assert_eq!(h[0].status, PipelineStatus::Ok);
+        assert!(h[0].last_error.is_none());
+        assert_eq!(h[0].feature_count, 3);
+    }
+
+    #[test]
+    fn health_is_sorted_by_layer() {
+        let mut m = manager();
+        for layer in ["zulu", "alpha", "mike"] {
+            m.apply_health_report(HealthReport::Ok {
+                layer: layer.into(),
+                count: 1,
+            });
+        }
+        let layers: Vec<_> = m.health().into_iter().map(|h| h.layer).collect();
+        assert_eq!(layers, vec!["alpha", "mike", "zulu"]);
+    }
+
+    #[test]
+    fn stop_clears_health() {
+        let mut m = manager();
+        m.apply_health_report(HealthReport::Ok {
+            layer: "a".into(),
+            count: 1,
+        });
+        m.apply_health_report(HealthReport::Ok {
+            layer: "b".into(),
+            count: 1,
+        });
+        m.stop(Some("a"));
+        assert_eq!(m.health().len(), 1);
+        assert_eq!(m.health()[0].layer, "b");
+        m.stop(None);
+        assert!(m.health().is_empty());
     }
 }
