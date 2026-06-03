@@ -347,6 +347,10 @@ pub struct PipelineManager {
     health_rx: mpsc::UnboundedReceiver<HealthReport>,
     /// Current global fetch-throttle level (CAR-7).  `Normal` by default → inert.
     throttle: ThrottleLevel,
+    /// High-level car-mode signal (CAR-7).  `false` by default → inert; toggled
+    /// via [`PipelineManager::set_car_mode`].  Distinct from `throttle`, which
+    /// the thermal governor can escalate independently.
+    car_mode: bool,
 }
 
 impl PipelineManager {
@@ -364,6 +368,7 @@ impl PipelineManager {
             health_tx,
             health_rx,
             throttle:   ThrottleLevel::Normal,
+            car_mode:   false,
         }
     }
 
@@ -390,6 +395,29 @@ impl PipelineManager {
     // with no layers paused, so behaviour is unchanged until the governor opts
     // in.  Graduated (a level, not a bool) and paired with an explicit
     // pause-offscreen hook so the governor can escalate smoothly.
+
+    /// High-level car-mode toggle (CAR-7) — the named interface boundary
+    /// `app.rs` wires to the head-unit's car-mode signal when CAR-4 lands.
+    ///
+    /// `true` applies a moderate baseline throttle for driving; `false` restores
+    /// the normal cadence and resumes any paused pipelines.  It is implemented
+    /// on top of the graduated [`set_throttle_level`](Self::set_throttle_level)
+    /// so the thermal governor can still escalate finer levels independently.
+    /// **Inert by default** (car mode off) — no behaviour change until wired.
+    pub fn set_car_mode(&mut self, on: bool) {
+        self.car_mode = on;
+        if on {
+            self.set_throttle_level(ThrottleLevel::Moderate);
+        } else {
+            self.set_throttle_level(ThrottleLevel::Normal);
+            self.resume_all();
+        }
+    }
+
+    /// Whether the high-level car-mode signal is currently on.
+    pub fn car_mode(&self) -> bool {
+        self.car_mode
+    }
 
     /// Set the global fetch-throttle level, applied to every registered source
     /// and inherited by future registrations.  `ThrottleLevel::Normal` restores
@@ -865,5 +893,28 @@ mod car_tests {
         for (_, sched) in &m.sources {
             assert!(!sched.paused);
         }
+    }
+
+    #[test]
+    fn set_car_mode_scales_cooldowns_and_is_inert_by_default() {
+        let mut m = manager();
+        m.register(source("a"));
+
+        // Inert by default: car mode off, normal cadence.
+        assert!(!m.car_mode());
+        let base = m.sources[0].1.effective_cooldown();
+        assert_eq!(m.sources[0].1.throttle, 1.0);
+
+        // Car mode on → cooldown/staleness windows scale up.
+        m.set_car_mode(true);
+        assert!(m.car_mode());
+        assert!(m.sources[0].1.throttle > 1.0);
+        assert!(m.sources[0].1.effective_cooldown() > base);
+
+        // Car mode off → back to the normal cadence.
+        m.set_car_mode(false);
+        assert!(!m.car_mode());
+        assert_eq!(m.sources[0].1.throttle, 1.0);
+        assert_eq!(m.sources[0].1.effective_cooldown(), base);
     }
 }
