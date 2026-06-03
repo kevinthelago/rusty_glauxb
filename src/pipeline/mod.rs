@@ -917,4 +917,24 @@ mod car_tests {
         assert_eq!(m.sources[0].1.throttle, 1.0);
         assert_eq!(m.sources[0].1.effective_cooldown(), base);
     }
+
+    #[test]
+    fn set_car_mode_is_idempotent() {
+        let mut m = manager();
+        m.register(source("a"));
+
+        // Enabling twice has the same effect as enabling once.
+        m.set_car_mode(true);
+        let (throttle_on, mode_on) = (m.sources[0].1.throttle, m.car_mode());
+        m.set_car_mode(true);
+        assert_eq!(m.sources[0].1.throttle, throttle_on);
+        assert_eq!(m.car_mode(), mode_on);
+        assert!(m.car_mode());
+
+        // Disabling twice returns to and stays at the inert baseline.
+        m.set_car_mode(false);
+        m.set_car_mode(false);
+        assert!(!m.car_mode());
+        assert_eq!(m.sources[0].1.throttle, 1.0);
+    }
 }
