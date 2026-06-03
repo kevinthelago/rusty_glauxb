@@ -153,6 +153,62 @@ pub struct HudAircraft {
     pub milsym:        Option<crate::milsym::MilSymbol>,
 }
 
+// ─── Touch / mobile UI sizing (ENG-7) ──────────────────────────────────────────
+//
+// These helpers make the egui HUD/console usable with a finger on mobile.  They
+// depend ONLY on the screen rect egui already derives from app.rs's existing
+// resize forwarding — not on any engine-core touch-input plumbing (ENG-4) — so
+// they merge cleanly whenever that lands.  Tap-routing / soft-keyboard
+// acceptance is deliberately out of scope here and waits on ENG-4.
+
+/// Logical screen width (points) at/below which a finger-friendly layout is
+/// used.  Phones report a small logical width in portrait regardless of DPI.
+const TOUCH_WIDTH_THRESHOLD: f32 = 600.0;
+
+/// Decide whether to use a touch layout from the logical screen width.
+/// Android always counts as touch; otherwise a narrow/compact screen does.
+/// Pure function so the threshold logic is unit-testable without an egui context.
+pub fn is_touch_layout(screen_width_pts: f32) -> bool {
+    cfg!(target_os = "android") || (screen_width_pts > 0.0 && screen_width_pts < TOUCH_WIDTH_THRESHOLD)
+}
+
+/// Finger-friendly UI metrics derived from the current egui context.
+pub struct TouchMetrics {
+    /// True when a finger-friendly layout should be used.
+    pub touch: bool,
+    /// Minimum interactive widget height (logical points) for comfortable taps.
+    pub min_target: f32,
+    /// Base body-text size (logical points).
+    pub text_size: f32,
+    /// Current logical screen width (points).
+    pub screen_width: f32,
+}
+
+/// Compute [`TouchMetrics`] for the current frame.
+pub fn touch_metrics(ctx: &egui::Context) -> TouchMetrics {
+    let screen_width = ctx.screen_rect().width();
+    let touch = is_touch_layout(screen_width);
+    TouchMetrics {
+        touch,
+        min_target: if touch { 44.0 } else { 0.0 },
+        text_size: if touch { 16.0 } else { 12.0 },
+        screen_width,
+    }
+}
+
+/// Apply finger-friendly spacing and hit-target sizes to `ui` in place.
+/// No-op on non-touch layouts, so desktop rendering is unchanged.
+pub fn apply_touch_spacing(ui: &mut egui::Ui, m: &TouchMetrics) {
+    if !m.touch {
+        return;
+    }
+    let s = ui.spacing_mut();
+    s.interact_size.y = s.interact_size.y.max(m.min_target);
+    s.button_padding = egui::vec2(12.0, 8.0);
+    s.item_spacing = egui::vec2(8.0, 8.0);
+    s.scroll.bar_width = 16.0;
+}
+
 pub struct Hud {
     voice_status:        Option<String>,
     diag_line:           Option<String>,
@@ -403,13 +459,17 @@ impl Hud {
                 .unwrap_or_else(|| feat.layer_name.clone());
 
             let mut open = true;
+            // Touch sizing (ENG-7): wider panel + finger-sized rows on mobile.
+            let m = touch_metrics(ctx);
+            let panel_w = if m.touch { (m.screen_width * 0.7).min(380.0).max(270.0) } else { 270.0 };
             egui::Window::new(title)
                 .id(egui::Id::new("geo_info_panel"))
                 .open(&mut open)
                 .resizable(true)
-                .default_width(270.0)
+                .default_width(panel_w)
                 .anchor(egui::Align2::RIGHT_BOTTOM, [-10.0, -10.0])
                 .show(ctx, |ui| {
+                    apply_touch_spacing(ui, &m);
                     egui::ScrollArea::vertical().max_height(350.0).show(ui, |ui| {
                         // Properties from GeoJSON
                         if let Some(obj) = feat.properties.as_object() {
@@ -845,5 +905,36 @@ fn aircraft_color(ac: &HudAircraft) -> egui::Color32 {
         "multi_engine"  => egui::Color32::from_rgb(77, 166, 255),
         "military"      => egui::Color32::from_rgb(255, 80, 60),
         _               => egui::Color32::from_rgb(255, 191, 0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // On non-Android hosts (where these tests run) is_touch_layout reduces to a
+    // screen-width check; on Android it is unconditionally true.
+    #[test]
+    #[cfg(not(target_os = "android"))]
+    fn narrow_screen_is_touch_wide_is_not() {
+        assert!(is_touch_layout(400.0), "phone-width portrait → touch");
+        assert!(is_touch_layout(599.0), "just under threshold → touch");
+        assert!(!is_touch_layout(600.0), "at threshold → not touch");
+        assert!(!is_touch_layout(1920.0), "desktop → not touch");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "android"))]
+    fn unknown_width_is_not_touch() {
+        // A zero/empty screen rect (first frame before layout) must not flip the
+        // whole UI into mobile mode.
+        assert!(!is_touch_layout(0.0));
+    }
+
+    #[test]
+    fn android_is_always_touch() {
+        #[cfg(target_os = "android")]
+        assert!(is_touch_layout(2000.0));
+        // On non-Android this just documents intent; nothing to assert.
     }
 }

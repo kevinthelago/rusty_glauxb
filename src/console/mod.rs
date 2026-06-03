@@ -338,7 +338,26 @@ impl Console {
             self.push("clip: copied to clipboard");
         }
 
+        // ── On-screen console toggle (ENG-7) ──────────────────────────────────
+        // Mobile has no physical backtick key, so always present a finger-sized
+        // button to open the console.  Rendered only while closed; the open
+        // window carries its own close affordance.  Pure egui — needs no
+        // touch-event plumbing from the render core.
         if !self.open {
+            let m = crate::hud::touch_metrics(ctx);
+            let size = if m.touch { 48.0 } else { 30.0 };
+            egui::Area::new(egui::Id::new("console_toggle_btn"))
+                .anchor(egui::Align2::LEFT_BOTTOM, [8.0, -8.0])
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    crate::hud::apply_touch_spacing(ui, &m);
+                    let btn = egui::Button::new(egui::RichText::new(">_").monospace().size(size * 0.42))
+                        .min_size(egui::vec2(size, size))
+                        .rounding(6.0);
+                    if ui.add(btn).on_hover_text("Open console (`)").clicked() {
+                        self.open = true;
+                    }
+                });
             return ConsoleOutput::default();
         }
 
@@ -367,14 +386,31 @@ impl Console {
         let mut submitted_cmd: Option<String> = None;
         let mut reset_ttl    = false;
 
-        egui::Window::new("Console")
+        // Touch / mobile-DPI sizing (ENG-7): on a narrow screen the console
+        // nearly fills the viewport and gets finger-sized hit targets; on
+        // desktop it keeps its compact fixed size.
+        let m = crate::hud::touch_metrics(ctx);
+        let win_w = if m.touch { (m.screen_width * 0.96).min(900.0) } else { 620.0 };
+        let win_h = if m.touch {
+            (ctx.screen_rect().height() * 0.9).min(1200.0)
+        } else {
+            420.0
+        };
+
+        let mut window = egui::Window::new("Console")
             .resizable(true)
-            .default_width(620.0)
-            .default_height(420.0)
+            .default_width(win_w)
+            .default_height(win_h)
             .collapsible(false)
             .order(egui::Order::Foreground)
-            .open(&mut window_open)
+            .open(&mut window_open);
+        if m.touch {
+            // Anchor near the top so the window can't drift off a small screen.
+            window = window.anchor(egui::Align2::CENTER_TOP, [0.0, 8.0]);
+        }
+        window
             .show(ctx, |ui| {
+                crate::hud::apply_touch_spacing(ui, &m);
                 let output_height = (ui.available_height() - 36.0).max(50.0);
 
                 let scroll_out = ScrollArea::vertical()
@@ -385,7 +421,7 @@ impl Console {
                         for line in &self.output {
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(line).monospace().size(12.0),
+                                    egui::RichText::new(line).monospace().size(m.text_size),
                                 )
                                 .truncate(),
                             );
