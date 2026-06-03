@@ -72,6 +72,10 @@ bytemuck = { version = "1", features = ["derive"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }
+# Native GPS via android.location.LocationManager (LOC-1). ndk-context exposes
+# the JavaVM + Activity that android-activity/winit install globally.
+jni = "0.21"
+ndk-context = "0.1"
 
 # Process memory sampling — not available on Android
 [target.'cfg(not(target_os = "android"))'.dependencies]

@@ -2734,6 +2734,8 @@ dependencies = [
  "futures-util",
  "glam",
  "hound",
+ "jni 0.21.1",
+ "ndk-context",
  "pollster",
  "reqwest",
  "roxmltree",
