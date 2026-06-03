@@ -47,6 +47,7 @@ pub mod config;
 pub mod flights;
 pub mod osm;
 pub mod rate_limit;
+pub mod remote;
 
 use std::{
     collections::HashMap,
