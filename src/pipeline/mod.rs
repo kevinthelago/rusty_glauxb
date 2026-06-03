@@ -43,6 +43,7 @@
 //! - More than `max_staleness_secs` have elapsed since the last fetch (default
 //!   30 s for live feeds, 300 s for static/cached sources).
 
+pub mod config;
 pub mod flights;
 pub mod osm;
 pub mod rate_limit;
