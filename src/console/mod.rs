@@ -2,6 +2,7 @@ use egui::{Context, Key, ScrollArea, TextEdit};
 use tracing::Level;
 
 use crate::log_capture::{LogBuffer, LogEntry};
+use crate::pipeline::config::{Cadence, PipelineConfig, PipelineStore};
 use crate::settings::Settings;
 
 const MAX_OUTPUT: usize = 500;
@@ -44,6 +45,9 @@ pub struct ConsoleOutput {
     pub symbol_cmd:        Option<SymbolCmd>,
     /// User issued `kill [<stream>]` — stop one or all pipeline streams.
     pub kill_target:       Option<KillTarget>,
+    /// User issued a `pipeline` sub-command that changes the active pipeline set;
+    /// caller should register/unregister the source with the `PipelineManager`.
+    pub pipeline_cmd:      Option<PipelineCmd>,
     /// User issued `quit` — request application exit.
     pub quit:              bool,
     /// Text to copy to the system clipboard; consumed inside `draw()`, never reaches `app.rs`.
@@ -66,10 +70,25 @@ impl Default for ConsoleOutput {
             milsym_cmd:        None,
             symbol_cmd:        None,
             kill_target:       None,
+            pipeline_cmd:      None,
             quit:              false,
             clip_text:         None,
         }
     }
+}
+
+/// User-defined-pipeline console commands forwarded to `app.rs`, which applies
+/// them to the live [`crate::pipeline::PipelineManager`].  The [`PipelineStore`]
+/// itself (persistence) is owned by [`Console`]; these intents only carry the
+/// runtime registration the manager must perform.
+#[derive(Debug, Clone)]
+pub enum PipelineCmd {
+    /// Register (or hot-swap) a pipeline's remote source and create its layer.
+    Add(PipelineConfig),
+    /// Remove a pipeline's source and layer by id.
+    Remove(String),
+    /// Enable (register) or disable (stop) an existing pipeline by id.
+    SetEnabled { id: String, enabled: bool },
 }
 
 /// Topology-layer console commands forwarded to `app.rs`.
@@ -232,6 +251,8 @@ pub struct Console {
     clip_next_push:   bool,
     /// Populated by push_line() when clip_next_push fires; copied to clipboard in draw().
     pending_clip_text: Option<String>,
+    /// Persisted set of user-defined pipelines (the `pipeline` command's state).
+    pipelines:        PipelineStore,
 }
 
 impl Console {
@@ -258,6 +279,7 @@ impl Console {
             log_buffer,
             clip_next_push:   false,
             pending_clip_text: None,
+            pipelines:        PipelineStore::load(),
         };
         c.push("rusty_glauxb console  —  type 'help' for commands");
         c
@@ -572,6 +594,7 @@ impl Console {
                 self.push("  aircraft    configure aircraft dot labels and click-to-follow");
                 self.push("  milsym      toggle MIL-STD-2525D military symbology mode");
                 self.push("  symbol      assign SVG icons per symbology standard");
+                self.push("  pipeline    add, list, and manage user-defined data pipelines");
                 self.push("  exit        close the console");
                 self.push("  kill        stop streams or kill the application");
             }
@@ -1374,12 +1397,152 @@ impl Console {
                 return self.exec_symbol(&parts, help);
             }
 
+            "pipeline" => {
+                return self.exec_pipeline(&parts, help);
+            }
+
             other => {
                 self.push(format!("unknown command '{other}'  (type 'help')"));
             }
         }
 
         ConsoleOutput::default()
+    }
+
+    /// `pipeline` — create, list, and manage user-defined data pipelines.
+    ///
+    /// The [`PipelineStore`] is mutated and persisted here (it is owned by the
+    /// console); a [`PipelineCmd`] is returned so `app.rs` can register or stop
+    /// the corresponding [`crate::pipeline::remote::RemoteGeoJsonSource`] on the
+    /// live [`crate::pipeline::PipelineManager`].
+    fn exec_pipeline(&mut self, parts: &[&str], help: bool) -> ConsoleOutput {
+        let sub = parts.get(1).copied().unwrap_or("");
+        // parts[2] holds the un-split remainder; re-tokenise it for sub-args.
+        let rest: Vec<&str> = parts
+            .get(2)
+            .map(|s| s.split_whitespace().collect())
+            .unwrap_or_default();
+
+        if help || sub == "help" {
+            self.push("pipeline  —  user-defined data pipelines");
+            self.push("");
+            self.push("  pipeline                       list all pipelines and status");
+            self.push("  pipeline list                  same as above");
+            self.push("  pipeline add <id> <url> [cadence]");
+            self.push("                                 add a remote-GeoJSON pipeline");
+            self.push("  pipeline remove <id>           delete a pipeline");
+            self.push("  pipeline enable <id>           start fetching a pipeline");
+            self.push("  pipeline disable <id>          stop fetching (keeps the config)");
+            self.push("");
+            self.push("  Cadence:");
+            self.push("    static            download-once, refetch after ~1 day (default)");
+            self.push("    every <secs>      refetch automatically every <secs> seconds");
+            self.push("");
+            self.push("  Examples:");
+            self.push("    pipeline add quakes https://earthquake.usgs.gov/…/all_day.geojson every 60");
+            self.push("    pipeline add myroads https://example.com/roads.geojson static");
+            return ConsoleOutput::default();
+        }
+
+        match sub {
+            "" | "list" => {
+                if self.pipelines.is_empty() {
+                    self.push("no pipelines  (type 'pipeline add help' to create one)");
+                } else {
+                    // Collect first: iterating self.pipelines borrows self immutably
+                    // while self.push needs it mutably.
+                    let rows: Vec<String> = self
+                        .pipelines
+                        .all()
+                        .iter()
+                        .map(|p| {
+                            let state = if p.enabled { "on " } else { "off" };
+                            let cadence = match p.cadence {
+                                Cadence::Static => "static".to_string(),
+                                Cadence::Dynamic { interval_secs } => {
+                                    format!("every {interval_secs:.0}s")
+                                }
+                            };
+                            format!("{:<18} {state}      {:<14} {}", p.id, cadence, p.url)
+                        })
+                        .collect();
+                    self.push("id                 state    cadence        url");
+                    for row in rows {
+                        self.push(row);
+                    }
+                }
+                ConsoleOutput::default()
+            }
+
+            "add" => {
+                let config = match parse_pipeline_add(&rest) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.push(format!("error: {e}"));
+                        return ConsoleOutput::default();
+                    }
+                };
+                match self.pipelines.add(config.clone()) {
+                    Ok(stored_id) => {
+                        self.pipelines.save();
+                        self.push(format!("pipeline '{stored_id}' added"));
+                        ConsoleOutput {
+                            pipeline_cmd: Some(PipelineCmd::Add(config)),
+                            ..Default::default()
+                        }
+                    }
+                    Err(e) => {
+                        self.push(format!("error: {e}"));
+                        ConsoleOutput::default()
+                    }
+                }
+            }
+
+            "remove" | "rm" | "delete" => {
+                let Some(id) = rest.first().copied() else {
+                    self.push("usage: pipeline remove <id>");
+                    return ConsoleOutput::default();
+                };
+                match self.pipelines.remove(id) {
+                    Some(removed) => {
+                        self.pipelines.save();
+                        self.push(format!("pipeline '{}' removed", removed.id));
+                        ConsoleOutput {
+                            pipeline_cmd: Some(PipelineCmd::Remove(removed.id)),
+                            ..Default::default()
+                        }
+                    }
+                    None => {
+                        self.push(format!("no pipeline with id '{id}'"));
+                        ConsoleOutput::default()
+                    }
+                }
+            }
+
+            "enable" | "disable" => {
+                let enabled = sub == "enable";
+                let Some(id) = rest.first().copied() else {
+                    self.push(format!("usage: pipeline {sub} <id>"));
+                    return ConsoleOutput::default();
+                };
+                if self.pipelines.set_enabled(id, enabled) {
+                    self.pipelines.save();
+                    self.push(format!("pipeline '{id}' {}", if enabled { "enabled" } else { "disabled" }));
+                    ConsoleOutput {
+                        pipeline_cmd: Some(PipelineCmd::SetEnabled { id: id.to_string(), enabled }),
+                        ..Default::default()
+                    }
+                } else {
+                    self.push(format!("no pipeline with id '{id}'"));
+                    ConsoleOutput::default()
+                }
+            }
+
+            other => {
+                self.push(format!("unknown pipeline sub-command '{other}'  (type 'pipeline help')"));
+                ConsoleOutput::default()
+            }
+        }
     }
 
     fn exec_download(&mut self, parts: &[&str], help: bool) -> ConsoleOutput {
@@ -1832,5 +1995,81 @@ impl Console {
             }
         }
         ConsoleOutput::default()
+    }
+}
+
+/// Parse the arguments of `pipeline add <id> <url> [static | every <secs>]`
+/// into a validated [`PipelineConfig`].  Returns a user-facing error string on
+/// bad input.  Pure (no I/O) so it is unit-testable in isolation.
+fn parse_pipeline_add(rest: &[&str]) -> Result<PipelineConfig, String> {
+    if rest.len() < 2 {
+        return Err("usage: pipeline add <id> <url> [static | every <secs>]".into());
+    }
+    let id = rest[0];
+    let url = rest[1];
+    let cadence = match rest.get(2).copied() {
+        None | Some("static") => Cadence::Static,
+        Some("every") | Some("dynamic") => {
+            let secs = rest
+                .get(3)
+                .and_then(|s| s.parse::<f32>().ok())
+                .ok_or("cadence 'every' needs a number of seconds, e.g. 'every 60'")?;
+            Cadence::Dynamic { interval_secs: secs }
+        }
+        Some(other) => {
+            return Err(format!(
+                "unknown cadence '{other}'  (use 'static' or 'every <secs>')"
+            ));
+        }
+    };
+    PipelineConfig::new(id, "", url, cadence)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_defaults_to_static_cadence() {
+        let c = parse_pipeline_add(&["roads", "https://e.com/r.geojson"]).unwrap();
+        assert_eq!(c.id, "roads");
+        assert_eq!(c.cadence, Cadence::Static);
+    }
+
+    #[test]
+    fn add_parses_explicit_static() {
+        let c = parse_pipeline_add(&["roads", "https://e.com/r.geojson", "static"]).unwrap();
+        assert_eq!(c.cadence, Cadence::Static);
+    }
+
+    #[test]
+    fn add_parses_dynamic_interval() {
+        let c = parse_pipeline_add(&["live", "https://e.com/l.geojson", "every", "45"]).unwrap();
+        assert_eq!(c.cadence, Cadence::Dynamic { interval_secs: 45.0 });
+    }
+
+    #[test]
+    fn add_requires_id_and_url() {
+        assert!(parse_pipeline_add(&[]).is_err());
+        assert!(parse_pipeline_add(&["onlyid"]).is_err());
+    }
+
+    #[test]
+    fn add_rejects_every_without_seconds() {
+        assert!(parse_pipeline_add(&["live", "https://e.com/l.geojson", "every"]).is_err());
+        assert!(parse_pipeline_add(&["live", "https://e.com/l.geojson", "every", "soon"]).is_err());
+    }
+
+    #[test]
+    fn add_rejects_unknown_cadence_and_bad_url() {
+        assert!(parse_pipeline_add(&["x", "https://e.com/a.geojson", "weekly"]).is_err());
+        assert!(parse_pipeline_add(&["x", "not-a-url"]).is_err());
+    }
+
+    #[test]
+    fn add_slugifies_id() {
+        // Args arrive pre-tokenised, so verify a punctuated id is slugified.
+        let c = parse_pipeline_add(&["my-roads!", "https://e.com/r.geojson"]).unwrap();
+        assert_eq!(c.id, "my_roads");
     }
 }
