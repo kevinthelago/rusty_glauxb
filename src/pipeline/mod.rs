@@ -111,24 +111,57 @@ struct QueryScheduler {
     backoff_until: Option<Instant>,
     /// Bypasses the cooldown floor for the very first fetch.
     force_next: bool,
+    /// Multiplier (>= 1.0) applied to the cooldown and staleness windows.
+    /// 1.0 = normal; car mode raises it to fetch less often while driving (CAR-7).
+    throttle: f32,
+    /// When true, the scheduler never fires — used by the pause-offscreen hook
+    /// (CAR-7) so the thermal governor can suspend individual pipelines.
+    paused: bool,
 }
 
 impl QueryScheduler {
     fn new(max_staleness_secs: f32, min_change_fraction: f32) -> Self {
+        // The DataSource trait lets purely-static sources return f32::INFINITY;
+        // Duration::from_secs_f32 panics on a non-finite value, so map "never
+        // re-fetch on staleness" to an effectively-infinite finite Duration
+        // (~136 years) that also stays safe when the CAR-7 throttle scales it.
+        let max_staleness = if max_staleness_secs.is_finite() {
+            Duration::from_secs_f32(max_staleness_secs)
+        } else {
+            Duration::from_secs(u32::MAX as u64)
+        };
         Self {
             last_bounds:         None,
             last_fetch:          Instant::now(),
-            max_staleness:       Duration::from_secs_f32(max_staleness_secs),
+            max_staleness,
             min_change_fraction,
             min_cooldown:        Duration::from_secs(60),
             backoff_until:       None,
             force_next:          true,
+            throttle:            1.0,
+            paused:              false,
         }
     }
 
     fn with_cooldown(mut self, secs: u64) -> Self {
         self.min_cooldown = Duration::from_secs(secs);
         self
+    }
+
+    /// Set the throttle multiplier (clamped to >= 1.0 so it never *speeds up*
+    /// fetching).  Used by car mode to back off all time-based fetching.
+    fn set_throttle(&mut self, factor: f32) {
+        self.throttle = factor.max(1.0);
+    }
+
+    /// Cooldown floor after applying the throttle.
+    fn effective_cooldown(&self) -> Duration {
+        self.min_cooldown.mul_f32(self.throttle)
+    }
+
+    /// Staleness window after applying the throttle.
+    fn effective_staleness(&self) -> Duration {
+        self.max_staleness.mul_f32(self.throttle)
     }
 
     /// Suppress fetches for at least `delay` from now.  Takes the maximum if
@@ -145,6 +178,11 @@ impl QueryScheduler {
 
     /// Returns `true` and records the new bounds if a fetch should fire.
     fn should_fetch(&mut self, bounds: &GeoBounds) -> bool {
+        // A paused pipeline never fetches (CAR-7 pause-offscreen hook).
+        if self.paused {
+            return false;
+        }
+
         let now = Instant::now();
 
         // Rate-limit backoff takes top priority.
@@ -165,13 +203,15 @@ impl QueryScheduler {
 
         let elapsed = now.duration_since(self.last_fetch);
 
-        // Never fetch faster than min_cooldown, regardless of other conditions.
-        if elapsed < self.min_cooldown {
+        // Never fetch faster than the (throttled) cooldown floor.  In car mode
+        // this gate also slows viewport-change fetches below, since it runs
+        // first.
+        if elapsed < self.effective_cooldown() {
             return false;
         }
 
-        // Always fetch on first call or after staleness timeout
-        if self.last_bounds.is_none() || elapsed >= self.max_staleness {
+        // Always fetch on first call or after the (throttled) staleness timeout
+        if self.last_bounds.is_none() || elapsed >= self.effective_staleness() {
             self.last_bounds = Some(bounds.clone());
             self.last_fetch  = now;
             return true;
@@ -250,6 +290,43 @@ enum HealthReport {
     Err { layer: String, error: String },
 }
 
+// ─── Throttling (CAR-7) ──────────────────────────────────────────────────────
+
+/// Graduated fetch-throttle level applied to every pipeline (CAR-7).
+///
+/// Higher levels multiply the cooldown/staleness windows so fetches fire less
+/// often — saving battery, mobile data, and GPU churn.  This is the
+/// **signal-only-from-CAR-4** half of car-mode throttling: the
+/// [`crate::car`] thermal governor (which cannot edit this module) escalates the
+/// level as the device heats up by calling
+/// [`PipelineManager::set_throttle_level`].  It is **inert by default**
+/// ([`ThrottleLevel::Normal`] = 1×), so landing it during Phase 1 changes
+/// nothing until something opts in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ThrottleLevel {
+    /// No throttling (default): normal fetch cadence.
+    #[default]
+    Normal,
+    /// Mild back-off (~2× longer windows).
+    Light,
+    /// Moderate back-off (~4× longer windows).
+    Moderate,
+    /// Aggressive back-off (~8× longer windows) for sustained thermal pressure.
+    Heavy,
+}
+
+impl ThrottleLevel {
+    /// Multiplier applied to each scheduler's cooldown and staleness windows.
+    pub fn multiplier(self) -> f32 {
+        match self {
+            ThrottleLevel::Normal => 1.0,
+            ThrottleLevel::Light => 2.0,
+            ThrottleLevel::Moderate => 4.0,
+            ThrottleLevel::Heavy => 8.0,
+        }
+    }
+}
+
 // ─── PipelineManager ─────────────────────────────────────────────────────────
 
 /// Holds all registered data sources and drives the fetch-dispatch loop.
@@ -268,6 +345,8 @@ pub struct PipelineManager {
     /// Fetch-outcome reports sent from spawned fetch tasks.
     health_tx: mpsc::UnboundedSender<HealthReport>,
     health_rx: mpsc::UnboundedReceiver<HealthReport>,
+    /// Current global fetch-throttle level (CAR-7).  `Normal` by default → inert.
+    throttle: ThrottleLevel,
 }
 
 impl PipelineManager {
@@ -284,6 +363,7 @@ impl PipelineManager {
             health:     HashMap::new(),
             health_tx,
             health_rx,
+            throttle:   ThrottleLevel::Normal,
         }
     }
 
@@ -296,8 +376,67 @@ impl PipelineManager {
             self.receivers.insert(layer.clone(), rx);
             tx
         });
-        let scheduler = make_scheduler(&*source);
+        let mut scheduler = make_scheduler(&*source);
+        // New sources inherit the current throttle level (CAR-7).
+        scheduler.set_throttle(self.throttle.multiplier());
         self.sources.push((source, scheduler));
+    }
+
+    // ── Throttling API (CAR-7) ──────────────────────────────────────────────
+    //
+    // The interface the CAR-4 thermal governor (in `crate::car`, which cannot
+    // edit this module) calls to back off pipeline work under thermal/battery
+    // pressure.  Inert by default: a fresh manager is at `ThrottleLevel::Normal`
+    // with no layers paused, so behaviour is unchanged until the governor opts
+    // in.  Graduated (a level, not a bool) and paired with an explicit
+    // pause-offscreen hook so the governor can escalate smoothly.
+
+    /// Set the global fetch-throttle level, applied to every registered source
+    /// and inherited by future registrations.  `ThrottleLevel::Normal` restores
+    /// the normal cadence.
+    pub fn set_throttle_level(&mut self, level: ThrottleLevel) {
+        self.throttle = level;
+        let mult = level.multiplier();
+        for (_, scheduler) in &mut self.sources {
+            scheduler.set_throttle(mult);
+        }
+    }
+
+    /// The current global throttle level.
+    pub fn throttle_level(&self) -> ThrottleLevel {
+        self.throttle
+    }
+
+    /// Pause or resume fetching for a single layer without unregistering it.
+    /// A paused layer keeps its config, channel, and last data; it simply stops
+    /// scheduling new fetches.  Returns `true` if the layer exists.
+    pub fn set_layer_paused(&mut self, layer: &str, paused: bool) -> bool {
+        let mut found = false;
+        for (source, scheduler) in &mut self.sources {
+            if source.layer_name() == layer {
+                scheduler.paused = paused;
+                found = true;
+            }
+        }
+        found
+    }
+
+    /// Pause every registered pipeline whose layer is **not** in `onscreen`, and
+    /// resume those that are.  The thermal governor calls this with the visible
+    /// layer set to suspend offscreen pipelines (CAR-7 "pause offscreen
+    /// pipelines" thermal step) — the manager has no visibility data of its own,
+    /// so the caller supplies it.
+    pub fn pause_offscreen(&mut self, onscreen: &[&str]) {
+        for (source, scheduler) in &mut self.sources {
+            scheduler.paused = !onscreen.contains(&source.layer_name());
+        }
+    }
+
+    /// Resume every paused pipeline (clears all pause-offscreen suspensions).
+    pub fn resume_all(&mut self) {
+        for (_, scheduler) in &mut self.sources {
+            scheduler.paused = false;
+        }
     }
 
     /// Obtain the watch receiver for a named layer.
@@ -457,7 +596,9 @@ impl PipelineManager {
         });
         // Drop all old sources for this layer, install the new one
         self.sources.retain(|(s, _)| s.layer_name() != layer);
-        let scheduler = make_scheduler(&*source);
+        let mut scheduler = make_scheduler(&*source);
+        // Inherit the current throttle level (CAR-7).
+        scheduler.set_throttle(self.throttle.multiplier());
         self.sources.push((source, scheduler));
     }
 
@@ -618,5 +759,111 @@ mod health_tests {
         assert_eq!(m.health()[0].layer, "b");
         m.stop(None);
         assert!(m.health().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod car_tests {
+    use super::*;
+
+    fn manager() -> PipelineManager {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        PipelineManager::new(rt.handle().clone())
+    }
+
+    fn source(layer: &str) -> Arc<dyn DataSource> {
+        Arc::new(StaticGeoJsonSource::new(layer, Vec::new()))
+    }
+
+    #[test]
+    fn throttle_levels_are_graduated_and_ordered() {
+        assert_eq!(ThrottleLevel::default(), ThrottleLevel::Normal);
+        assert_eq!(ThrottleLevel::Normal.multiplier(), 1.0);
+        assert!(ThrottleLevel::Light.multiplier() < ThrottleLevel::Moderate.multiplier());
+        assert!(ThrottleLevel::Moderate.multiplier() < ThrottleLevel::Heavy.multiplier());
+        // Ord lets the thermal governor escalate by comparing levels.
+        assert!(ThrottleLevel::Normal < ThrottleLevel::Heavy);
+    }
+
+    #[test]
+    fn scheduler_throttle_scales_windows_and_clamps() {
+        let mut s = QueryScheduler::new(30.0, 0.25); // 60s cooldown, 30s staleness
+        assert_eq!(s.effective_cooldown().as_secs(), 60);
+        assert_eq!(s.effective_staleness().as_secs(), 30);
+        s.set_throttle(4.0);
+        assert_eq!(s.effective_cooldown().as_secs(), 240);
+        assert_eq!(s.effective_staleness().as_secs(), 120);
+        // Never speeds fetching up.
+        s.set_throttle(0.25);
+        assert_eq!(s.throttle, 1.0);
+    }
+
+    #[test]
+    fn paused_scheduler_never_fetches() {
+        let mut s = QueryScheduler::new(30.0, 0.25);
+        s.paused = true;
+        assert!(!s.should_fetch(&GeoBounds::global()));
+    }
+
+    #[test]
+    fn manager_is_inert_by_default() {
+        let mut m = manager();
+        m.register(source("a"));
+        m.register(source("b"));
+        assert_eq!(m.throttle_level(), ThrottleLevel::Normal);
+        for (_, s) in &m.sources {
+            assert_eq!(s.throttle, 1.0);
+            assert!(!s.paused);
+        }
+    }
+
+    #[test]
+    fn set_throttle_level_applies_and_is_inherited() {
+        let mut m = manager();
+        m.register(source("a"));
+        m.set_throttle_level(ThrottleLevel::Heavy);
+        assert_eq!(m.throttle_level(), ThrottleLevel::Heavy);
+        for (_, s) in &m.sources {
+            assert_eq!(s.throttle, 8.0);
+        }
+        // A source registered after the level was raised inherits it.
+        m.register(source("b"));
+        let b = m.sources.iter().find(|(s, _)| s.layer_name() == "b").unwrap();
+        assert_eq!(b.1.throttle, 8.0);
+        // Restoring Normal clears the throttle.
+        m.set_throttle_level(ThrottleLevel::Normal);
+        for (_, s) in &m.sources {
+            assert_eq!(s.throttle, 1.0);
+        }
+    }
+
+    #[test]
+    fn pause_layer_and_offscreen_and_resume() {
+        let mut m = manager();
+        m.register(source("a"));
+        m.register(source("b"));
+        m.register(source("c"));
+
+        assert!(m.set_layer_paused("a", true));
+        assert!(!m.set_layer_paused("missing", true));
+        let a = m.sources.iter().find(|(s, _)| s.layer_name() == "a").unwrap();
+        assert!(a.1.paused);
+
+        // Only "b" on screen → a and c paused, b active.
+        m.pause_offscreen(&["b"]);
+        for (s, sched) in &m.sources {
+            if s.layer_name() == "b" {
+                assert!(!sched.paused);
+            } else {
+                assert!(sched.paused);
+            }
+        }
+
+        m.resume_all();
+        for (_, sched) in &m.sources {
+            assert!(!sched.paused);
+        }
     }
 }
